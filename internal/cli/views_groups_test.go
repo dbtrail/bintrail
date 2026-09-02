@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,10 +14,26 @@ import (
 
 const groupTestID = "aaaa"
 
-func groupTestBase() string { return "/arc/bintrail_id=" + groupTestID }
+// A real directory with real files: ArchiveGroups stats every local path before
+// it will put one in a group (a registered file that is gone would make DuckDB
+// refuse the whole script).
+func groupTestBase(t *testing.T) string {
+	t.Helper()
+	base := filepath.Join(t.TempDir(), "bintrail_id="+groupTestID)
+	for _, hour := range []string{"03", "04"} {
+		p := groupTestFile(base, hour)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return base
+}
 
-func groupTestFile(hour string) string {
-	return groupTestBase() + "/event_date=2026-05-01/event_hour=" + hour + "/e.parquet"
+func groupTestFile(base, hour string) string {
+	return base + "/event_date=2026-05-01/event_hour=" + hour + "/e.parquet"
 }
 
 // The whole point of #1535 reaching the downloadable file: `bintrail views`
@@ -27,12 +45,13 @@ func TestResolveArchiveGroupsFrom_carriesTheGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	base := groupTestBase(t)
 	mock.ExpectQuery("FROM archive_state").WillReturnRows(
 		sqlmock.NewRows([]string{"bintrail_id", "local_path", "s3_key", "column_set"}).
-			AddRow(groupTestID, groupTestFile("03"), nil, "event_id,query_text").
-			AddRow(groupTestID, groupTestFile("04"), nil, "event_id"))
+			AddRow(groupTestID, groupTestFile(base, "03"), nil, "event_id,query_text").
+			AddRow(groupTestID, groupTestFile(base, "04"), nil, "event_id"))
 
-	in := views.Input{ArchiveSources: []string{groupTestBase()}}
+	in := views.Input{ArchiveSources: []string{base}}
 	if err := resolveArchiveGroupsFrom(context.Background(), db, &in); err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +71,7 @@ func TestResolveArchiveGroupsFrom_carriesTheGroups(t *testing.T) {
 	if strings.Contains(sql, "union_by_name = true") {
 		t.Errorf("the generated file still asks DuckDB to unify every footer:\n%s", sql)
 	}
-	if !strings.Contains(sql, groupTestFile("03")) {
+	if !strings.Contains(sql, groupTestFile(base, "03")) {
 		t.Errorf("the generated file does not name the archived partitions:\n%s", sql)
 	}
 }
@@ -67,12 +86,13 @@ func TestResolveArchiveGroupsFrom_partialRegistryKeepsTheGlob(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	base := groupTestBase(t)
 	mock.ExpectQuery("FROM archive_state").WillReturnRows(
 		sqlmock.NewRows([]string{"bintrail_id", "local_path", "s3_key", "column_set"}).
-			AddRow(groupTestID, groupTestFile("03"), nil, "event_id,query_text").
-			AddRow(groupTestID, groupTestFile("04"), nil, nil))
+			AddRow(groupTestID, groupTestFile(base, "03"), nil, "event_id,query_text").
+			AddRow(groupTestID, groupTestFile(base, "04"), nil, nil))
 
-	in := views.Input{ArchiveSources: []string{groupTestBase()}}
+	in := views.Input{ArchiveSources: []string{base}}
 	if err := resolveArchiveGroupsFrom(context.Background(), db, &in); err != nil {
 		t.Fatal(err)
 	}
@@ -89,10 +109,10 @@ func TestResolveArchiveGroupsFrom_partialRegistryKeepsTheGlob(t *testing.T) {
 		ArchiveSources:      in.ArchiveSources,
 		UngroupedPartitions: in.UngroupedPartitions,
 	})
-	if !strings.Contains(sql, "no recorded column set") {
+	if !strings.Contains(sql, "cannot be grouped by schema") {
 		t.Errorf("the file does not explain why it still binds every footer:\n%s", sql)
 	}
-	if !strings.Contains(sql, "archive reconcile --repair") {
+	if !strings.Contains(sql, "bintrail archive reconcile") || !strings.Contains(sql, "--repair") {
 		t.Errorf("the file names no way to fix it:\n%s", sql)
 	}
 }

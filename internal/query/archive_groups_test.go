@@ -2,6 +2,8 @@ package query
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -13,6 +15,21 @@ const (
 	wide   = "commit_ts_us,event_id,query_text"
 	narrow = "event_id"
 )
+
+// touch creates an empty file at path, making it listable. ArchiveGroups stats
+// every LOCAL path it would put in a group: DuckDB fails an explicit
+// read_parquet list on one absent entry, where a glob simply does not match it,
+// so a row whose file is gone disqualifies grouping instead of poisoning it.
+func touch(t *testing.T, path string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
 
 // groupRows builds the archive_state read ArchiveGroups performs.
 func groupRows(rows ...[4]any) *sqlmock.Rows {
@@ -32,7 +49,10 @@ func TestArchiveGroups_groupsByColumnSet(t *testing.T) {
 	}
 	defer db.Close()
 	const id = "aaaa"
-	p := func(d, h string) string { return "/arc/bintrail_id=" + id + "/event_date=" + d + "/event_hour=" + h + "/e.parquet" }
+	root := t.TempDir()
+	p := func(d, h string) string {
+		return touch(t, filepath.Join(root, "bintrail_id="+id, "event_date="+d, "event_hour="+h, "e.parquet"))
+	}
 	mock.ExpectQuery("FROM archive_state").WillReturnRows(groupRows(
 		[4]any{id, p("2026-05-01", "03"), nil, wide},
 		[4]any{id, p("2026-04-01", "01"), nil, narrow},
@@ -40,7 +60,7 @@ func TestArchiveGroups_groupsByColumnSet(t *testing.T) {
 		[4]any{id, p("2026-05-01", "04"), nil, wide},
 	))
 
-	groups, ungrouped, err := ArchiveGroups(context.Background(), db, []string{"/arc/bintrail_id=" + id})
+	groups, ungrouped, err := ArchiveGroups(context.Background(), db, []string{filepath.Join(root, "bintrail_id="+id)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +93,10 @@ func TestArchiveGroups_oneUnrecordedPartitionIsReported(t *testing.T) {
 	}
 	defer db.Close()
 	const id = "aaaa"
-	base := "/arc/bintrail_id=" + id
+	base := filepath.Join(t.TempDir(), "bintrail_id="+id)
+	touch(t, base+"/event_date=2026-05-01/event_hour=03/e.parquet")
+	touch(t, base+"/event_date=2026-05-01/event_hour=04/e.parquet")
+	touch(t, base+"/event_date=2026-05-01/event_hour=05/e.parquet")
 	mock.ExpectQuery("FROM archive_state").WillReturnRows(groupRows(
 		[4]any{id, base + "/event_date=2026-05-01/event_hour=03/e.parquet", nil, wide},
 		[4]any{id, base + "/event_date=2026-05-01/event_hour=04/e.parquet", nil, nil},
@@ -107,12 +130,16 @@ func TestArchiveGroups_rebuildsUnderTheRoutedBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	root := t.TempDir()
+	locFile := touch(t, filepath.Join(root, "bintrail_id=locsrc", "event_date=2026-05-01", "event_hour=03", "e.parquet"))
 	mock.ExpectQuery("FROM archive_state").WillReturnRows(groupRows(
 		// Routed to S3: the s3_key tail wins even though a local path exists.
+		// The local file is deliberately NOT created — an s3:// base is taken
+		// on the registry's word, so this row must still be grouped.
 		[4]any{"s3src", "/local/bintrail_id=s3src/event_date=2026-05-01/event_hour=03/local.parquet",
 			"deep/prefix/bintrail_id=s3src/event_date=2026-05-01/event_hour=03/remote.parquet", wide},
 		// Routed locally: the local tail wins.
-		[4]any{"locsrc", "/arc/bintrail_id=locsrc/event_date=2026-05-01/event_hour=03/e.parquet",
+		[4]any{"locsrc", locFile,
 			"k/bintrail_id=locsrc/event_date=2026-05-01/event_hour=03/other.parquet", wide},
 		// A source the caller did not route at all is not this function's to
 		// include, and must not count as unrecorded either.
@@ -120,7 +147,7 @@ func TestArchiveGroups_rebuildsUnderTheRoutedBase(t *testing.T) {
 	))
 
 	groups, ungrouped, err := ArchiveGroups(context.Background(), db,
-		[]string{"s3://bkt/deep/prefix/bintrail_id=s3src", "/arc/bintrail_id=locsrc"})
+		[]string{"s3://bkt/deep/prefix/bintrail_id=s3src", filepath.Join(root, "bintrail_id=locsrc")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +155,7 @@ func TestArchiveGroups_rebuildsUnderTheRoutedBase(t *testing.T) {
 		t.Fatalf("ungrouped = %d, want 0", ungrouped)
 	}
 	want := []string{
-		"/arc/bintrail_id=locsrc/event_date=2026-05-01/event_hour=03/e.parquet",
+		locFile,
 		"s3://bkt/deep/prefix/bintrail_id=s3src/event_date=2026-05-01/event_hour=03/remote.parquet",
 	}
 	if len(groups) != 1 || !reflect.DeepEqual(groups[0].Files, want) {
@@ -194,5 +221,67 @@ func TestArchiveGroups_toleratesAnUnmigratedIndex(t *testing.T) {
 	mock.ExpectQuery("FROM archive_state").WillReturnError(&drivermysql.MySQLError{Number: 1142})
 	if _, _, err := ArchiveGroups(context.Background(), db, []string{"/arc/bintrail_id=aaaa"}); err == nil {
 		t.Error("a permission failure was swallowed")
+	}
+}
+
+// A REGISTERED ROW WHOSE FILE IS GONE is a modeled state here: `archive
+// reconcile` reports it and only an explicit --prune clears it. A glob does not
+// match the missing file and the query returns the rest; an explicit path list
+// makes DuckDB fail the entire read_parquet, and since a view binds eagerly
+// that failure takes down every statement in the generated script.
+//
+// So a local path we cannot stat disqualifies grouping exactly like an
+// unrecorded column set does, and the globbed leg — which tolerates it — stays.
+func TestArchiveGroups_aRegisteredFileThatIsGoneDisqualifiesGrouping(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	const id = "aaaa"
+	base := filepath.Join(t.TempDir(), "bintrail_id="+id)
+	here := touch(t, base+"/event_date=2026-05-01/event_hour=03/e.parquet")
+	gone := base + "/event_date=2026-05-01/event_hour=04/e.parquet"
+	mock.ExpectQuery("FROM archive_state").WillReturnRows(groupRows(
+		[4]any{id, here, nil, wide},
+		[4]any{id, gone, nil, wide},
+	))
+
+	groups, ungrouped, err := ArchiveGroups(context.Background(), db, []string{base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ungrouped != 1 {
+		t.Fatalf("ungrouped = %d, want 1 — the missing file must disqualify grouping, "+
+			"not be listed in a group DuckDB then refuses to bind", ungrouped)
+	}
+	for _, g := range groups {
+		for _, f := range g.Files {
+			if f == gone {
+				t.Fatalf("a file that is not on disk was put in a group: %s", f)
+			}
+		}
+	}
+}
+
+// An s3:// base is taken on the registry's word. Probing it costs one request
+// per row, which is the per-file cost this whole change exists to remove, so
+// the trade is deliberate: the SQL panel carries a retry for the half that
+// cannot be checked here.
+func TestArchiveGroups_doesNotProbeS3(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("FROM archive_state").WillReturnRows(groupRows(
+		[4]any{"aaaa", nil, "k/bintrail_id=aaaa/event_date=2026-05-01/event_hour=03/e.parquet", wide},
+	))
+	groups, ungrouped, err := ArchiveGroups(context.Background(), db, []string{"s3://bkt/k/bintrail_id=aaaa"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ungrouped != 0 || len(groups) != 1 {
+		t.Fatalf("an S3 row was disqualified without being probed: groups=%v ungrouped=%d", groups, ungrouped)
 	}
 }

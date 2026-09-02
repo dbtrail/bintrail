@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"slices"
 	"strings"
 
@@ -35,8 +36,10 @@ type ArchiveGroup struct {
 // column set (archive_state.column_set, #1535).
 //
 // unrecorded counts partitions under those sources whose column set is NOT
-// recorded — pre-#1535 rows, and rows registered by `upload`, which never reads
-// a footer. It is returned rather than folded into the groups because the two
+// recorded: rows written before #1535, rows an S3-only `archive reconcile`
+// registered without --deep (no remote footer is read without it), and rows
+// whose file is not where the registry says it is. It is returned rather than
+// folded into the groups because the two
 // halves cannot be mixed: a partition with no recorded set cannot join a group
 // (it might hold any columns), and putting each one in a group of its own would
 // restore the per-file bind this exists to remove. Callers use groups ONLY when
@@ -111,7 +114,25 @@ func ArchiveGroups(ctx context.Context, db *sql.DB, sources []string) (groups []
 			unrecorded++
 			continue
 		}
-		byColumns[set] = append(byColumns[set], base+"/"+rel)
+		path := base + "/" + rel
+		if !localFileListable(path) {
+			// A REGISTERED ROW WHOSE FILE IS GONE is a modeled state in this
+			// product, not corruption: `archive reconcile` reports it and only
+			// an explicit --prune clears it. A glob simply does not match the
+			// missing file; an explicit path list makes DuckDB fail the whole
+			// read_parquet, and since a view binds eagerly that failure takes
+			// down every statement in the generated script — events and the
+			// state views with it. So a row we cannot see on disk disqualifies
+			// grouping the same way an unrecorded one does, and the globbed
+			// leg (which tolerates it) stays.
+			//
+			// Local only. An S3 object cannot be probed without a request per
+			// row, which is the per-file cost this whole change removes, so an
+			// S3 row is taken on the registry's word.
+			unrecorded++
+			continue
+		}
+		byColumns[set] = append(byColumns[set], path)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("iterate archive_state column sets: %w", err)
@@ -123,15 +144,35 @@ func ArchiveGroups(ctx context.Context, db *sql.DB, sources []string) (groups []
 	for _, set := range slices.Sorted(maps.Keys(byColumns)) {
 		files := byColumns[set]
 		slices.Sort(files)
+		// Split here rather than through a helper in internal/archive: query
+		// cannot import that package (archive imports baseline, and baseline's
+		// tests reach back to query through recovery — a test-only import
+		// cycle). The empty case never arrives; it was refused above.
 		groups = append(groups, ArchiveGroup{Columns: strings.Split(set, ","), Files: slices.Compact(files)})
 	}
 	return groups, unrecorded, nil
 }
 
+// localFileListable reports whether a path can be named in an explicit
+// read_parquet list. An s3:// URL is taken on trust (see the call site); a
+// local path must exist, because DuckDB fails the entire scan on one absent
+// entry where a glob would simply not match it.
+func localFileListable(path string) bool {
+	if strings.HasPrefix(path, "s3://") {
+		return true
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // bintrailIDOf reads the `bintrail_id=<id>` segment an archive base path ends
 // with. Empty when the path does not carry one — the same shape
-// extractBasePath produces from a registry row, so a base without it cannot be
-// matched to a row and is left to the globbed leg.
+// extractBasePath produces from a registry row.
+//
+// A base without one matches no row, so every partition under it counts as
+// unrecorded and the caller keeps the globbed leg for the whole layout. Both
+// producers of these paths always emit the segment; this is the safe answer if
+// one ever stops.
 func bintrailIDOf(base string) string {
 	const marker = "bintrail_id="
 	i := strings.LastIndex(base, marker)

@@ -19,15 +19,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. Explicit paths still carry `hive_partitioning`, so `bintrail_id`,
   `event_date` and `event_hour` are still synthesized and a filter on them
   still prunes files.
-  Rotation records the set for archives it writes. For archives already on
-  disk, `bintrail archive reconcile --repair` records it from the footer it
-  already reads for `row_count` — no extra file opens, and not gated on
-  `--deep`. Until every registered partition has one, the generated SQL keeps
-  the globbed form and says so, naming the command: the file list comes from
-  the registry, so grouping a partial one would leave the unrecorded
-  partitions out of the view rather than merely slow to bind. `archive
-  reconcile` now migrates the index schema before reading, like the other
-  archive_state readers.
+  Rotation records the set for archives it writes, and `restore-index` records
+  it for archives it re-registers. For archives already on disk, `bintrail
+  archive reconcile --repair` records it from the footer it already reads for
+  `row_count` — no extra file opens. **On an S3 archive that means `--deep
+  --repair`**: without `--deep` no remote footer is read, so the repair records
+  nothing. The first reconcile after upgrading reports drift on every partition
+  that predates the column; that is the backfill asking to be run, not a new
+  fault.
+  Until every registered partition has a recorded set AND its file is where the
+  registry says it is, the generated SQL keeps the globbed form and says so,
+  naming the command. The file list comes from the registry rather than a glob,
+  so grouping a partial one would leave those partitions out of the view rather
+  than merely slow to bind — and a listed file that is not there makes DuckDB
+  refuse the whole script, `events` and every state view with it. The console
+  SQL panel additionally retries over the whole layout if the grouped views do
+  not bind, so a registry fault degrades the panel to slow instead of blank.
+  **A grouped file does not follow the layout**: it names its archives
+  explicitly, so partitions archived after it was generated are not in it. The
+  header says which of the two forms the file uses; regenerate on the schedule
+  rotation archives on. `archive reconcile` now migrates `archive_state` before
+  reading it (that table only — its dry run is a cron drift monitor, and the
+  full migration also touches `binlog_events`).
 
 ## [0.76.0] - 2026-09-01
 

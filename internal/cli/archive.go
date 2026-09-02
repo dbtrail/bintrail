@@ -46,10 +46,20 @@ registry row each file implies, and diffs against archive_state:
   - rows without files   → reported; --prune deletes them (registry rows
                            only; data files are NEVER touched)
   - metadata drift       → --repair updates (file size always; row counts
-                           only under --deep, which reads Parquet footers)
+                           and the archived column set from Parquet footers,
+                           which a local scan reads anyway and an S3 scan
+                           reads only under --deep)
+
+The archived column set is what lets bintrail views and the console SQL panel
+read the layout one group per schema instead of opening every file's footer on
+every query (#1535). On an S3 archive that means --deep --repair: without
+--deep no remote footer is read, so the repair records nothing.
 
 The default is a DRY-RUN that prints the drift and exits non-zero when any
-exists; safe to run from cron as a drift monitor.
+exists; safe to run from cron as a drift monitor. Note the first run after
+upgrading to a build that records the column set reports drift on every
+partition that predates it — that is the backfill asking to be run, not a new
+fault.
 
 Safety rules:
   - a row is only a prune candidate when EVERY backend it references was
@@ -203,15 +213,20 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 	defer db.Close()
 
 	// reconcile reads and writes archive_state columns this build knows about,
-	// so it migrates first — the same rule the read paths adopted when
-	// query_text/query_hash were added (#699): a SELECT naming a column the
-	// index has not been migrated to is a hard 1054, not a degraded read.
+	// so it migrates THAT TABLE first — the same rule the read paths adopted
+	// when query_text/query_hash were added (#699): a SELECT naming a column
+	// the index has not been migrated to is a hard 1054, not a degraded read.
 	// column_set (#1535) is the current instance: without this, `archive
 	// reconcile` against an index whose rotation is older than this binary
 	// fails outright, which is exactly the operator most likely to run it.
-	// Idempotent, and it never touches data.
-	if err := indexer.EnsureSchema(db); err != nil {
-		return fmt.Errorf("migrate index schema: %w", err)
+	//
+	// EnsureArchiveStateSchema, NOT EnsureSchema: this command's dry run is
+	// documented as a read-only cron drift monitor, and the full migration also
+	// adds columns to binlog_events — the largest table in the deployment.
+	// Instant on a current MySQL, a rebuild on an older one, and either way not
+	// something a monitor should start on its own.
+	if err := indexer.EnsureArchiveStateSchema(db); err != nil {
+		return fmt.Errorf("migrate archive_state schema: %w", err)
 	}
 
 	rows, err := loadArchiveStateRows(ctx, db)

@@ -582,6 +582,14 @@ func writeHeader(b *strings.Builder, in Input) {
 		orUnknown(in.Version), in.GeneratedAt.UTC().Format(time.RFC3339))
 	b.WriteString("--\n")
 	b.WriteString("-- THIS FILE IS A SNAPSHOT OF THE LAYOUT, NOT A LIVE BINDING. ")
+	// The events view follows the layout only when it is GLOBBED. A grouped one
+	// (#1535) names its archived files one by one, which is what buys the cheap
+	// bind and what costs the self-updating: partitions archived later are not
+	// in it. Every sentence below that says the file keeps up with rotation is
+	// gated on this, because getting it wrong is worse than saying nothing —
+	// the reader keeps a file that quietly stopped covering the recent end of
+	// their history.
+	grouped := len(in.ArchiveGroups) > 0
 	// checksSnapshot, not Follow.follows(), for the sentence below that names
 	// the dropped-table check. The two are the same today for every render a
 	// producer makes, and they come apart for a filtered one: writeStateViews
@@ -603,7 +611,14 @@ func writeHeader(b *strings.Builder, in Input) {
 		if in.Follow == FollowNewest {
 			how = "select the newest completed snapshot"
 		}
-		if in.rendersEvents() {
+		if in.rendersEvents() && grouped {
+			b.WriteString("The events view below\n")
+			b.WriteString("-- names the archived files it reads one by one, so partitions archived\n")
+			b.WriteString("-- after this file was written are NOT in it, with no error and no warning:\n")
+			b.WriteString("-- a query over the most recent hours simply returns nothing for them.\n")
+			b.WriteString("-- Regenerate on the schedule your rotation archives on. The baseline state\n")
+			b.WriteString("-- views do " + how + ", so a refreshed baseline reaches them\n")
+		} else if in.rendersEvents() {
 			b.WriteString("The globs below\n")
 			b.WriteString("-- keep picking up newly rotated partitions, and the baseline state views\n")
 			b.WriteString("-- " + how + ", so a refreshed baseline reaches them\n")
@@ -635,6 +650,16 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("-- changes to some other type arrives as whatever the new file holds (an\n")
 		b.WriteString("-- ORDER BY can start sorting text), and an archive source added later is\n")
 		b.WriteString("-- simply not here. None of those raise an error.\n")
+	} else if in.rendersEvents() && grouped {
+		b.WriteString("The events view below\n")
+		b.WriteString("-- names the archived files it reads, one by one, and the baseline state views\n")
+		b.WriteString("-- point at ONE snapshot. NOTHING here updates itself: partitions archived\n")
+		b.WriteString("-- after this file was written are not in it, with no error and no warning —\n")
+		b.WriteString("-- a query over the most recent hours simply returns nothing for them.\n")
+		b.WriteString("-- Regenerate this file on the schedule your rotation archives on, and after\n")
+		b.WriteString("-- taking or refreshing a baseline, and whenever archive sources are added or\n")
+		b.WriteString("-- removed. Re-run `bintrail views`, or download the file again from the\n")
+		b.WriteString("-- console.\n")
 	} else if in.rendersEvents() {
 		// The one self-following half of the file, and only the events view
 		// has it: its globs are evaluated per query. Claimed only when that
@@ -1200,22 +1225,38 @@ func writeEventsView(b *strings.Builder, in Input, stateSurvives bool) bool {
 			b.WriteString("-- opens EVERY file's footer to unify the schema, on every statement, and the\n")
 			b.WriteString("-- wait grows with the archive. Grouping makes that one footer per group.\n")
 			b.WriteString("--\n")
-			b.WriteString("-- The file list comes from archive_state, so a file under one of these roots\n")
-			b.WriteString("-- with no row there is not read. `bintrail archive reconcile` reports those.\n")
+			b.WriteString("-- The file list is FIXED, and it comes from archive_state. Two consequences,\n")
+			b.WriteString("-- both worth knowing before you save this file:\n")
+			b.WriteString("--   - partitions archived after this was generated are not read. Regenerate.\n")
+			b.WriteString("--   - a file under one of these roots with no archive_state row is not read.\n")
+			b.WriteString("-- `bintrail archive reconcile` exits non-zero on both kinds of drift; it\n")
+			b.WriteString("-- reports counts per partition, not file paths.\n")
 		} else {
 			b.WriteString("-- union_by_name is required, not cosmetic: archives written before a column\n")
 			b.WriteString("-- existed simply lack it, and those files must read back with NULLs rather\n")
 			b.WriteString("-- than failing the whole scan. A column absent from EVERY archived file is\n")
-			b.WriteString("-- still an error: drop it from the SELECT if you hit that on an old archive.\n")
+			b.WriteString("-- still an error here: drop it from the SELECT if you hit that on an old\n")
+			b.WriteString("-- archive. (The grouped form this file is not using pads it with NULL.)\n")
 			b.WriteString("--\n")
 			b.WriteString("-- COST: union_by_name makes DuckDB open one Parquet footer per archived file\n")
 			b.WriteString("-- to unify the schema, and a view re-binds on every statement, so the wait\n")
 			b.WriteString("-- before the first row grows with the archive.\n")
 			if in.UngroupedPartitions > 0 {
-				fmt.Fprintf(b, "-- %d archived partition(s) have no recorded column set, so they cannot be\n", in.UngroupedPartitions)
-				b.WriteString("-- grouped by schema. `bintrail archive reconcile --repair` records it from\n")
-				b.WriteString("-- each footer, once, offline; regenerating this file afterwards emits one\n")
-				b.WriteString("-- read_parquet per column set instead, which binds one footer per group.\n")
+				fmt.Fprintf(b, "-- %d archived partition(s) cannot be grouped by schema: no recorded column\n", in.UngroupedPartitions)
+				b.WriteString("-- set, or a registered file that is not on disk. Recording the set reads\n")
+				b.WriteString("-- each footer once, offline:\n")
+				if in.NeedsS3() {
+					// --deep is not optional on S3: without it the scan never
+					// opens a remote footer, so the repair finds nothing to
+					// record and the wait stays exactly as it is.
+					b.WriteString("--   bintrail archive reconcile --index-dsn ... --archive-s3 ... --deep --repair\n")
+					b.WriteString("-- `--deep` is what reads the footers over S3; without it the repair records\n")
+					b.WriteString("-- nothing and this note comes back unchanged.\n")
+				} else {
+					b.WriteString("--   bintrail archive reconcile --index-dsn ... --archive-dir ... --repair\n")
+				}
+				b.WriteString("-- Regenerating this file afterwards emits one read_parquet per column set,\n")
+				b.WriteString("-- which binds one footer per group instead of one per file.\n")
 			}
 		}
 	}

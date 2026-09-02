@@ -86,7 +86,7 @@ func TestViewsAPI_partialRegistryKeepsTheGlob(t *testing.T) {
 		t.Errorf("the console grouped a registry that cannot account for every partition, "+
 			"so event_hour=04 is not in the view at all:\n%s", sql)
 	}
-	if !strings.Contains(sql, "no recorded column set") {
+	if !strings.Contains(sql, "cannot be grouped by schema") {
 		t.Errorf("the file does not explain why it still binds every footer:\n%s", sql)
 	}
 }

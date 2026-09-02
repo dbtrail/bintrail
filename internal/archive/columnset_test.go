@@ -3,7 +3,6 @@ package archive
 import (
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -59,21 +58,6 @@ func TestColumnSet_matchesTheArchiveWriter(t *testing.T) {
 		if !strings.Contains(","+got+",", ","+strings.ToLower(c.Name)+",") {
 			t.Errorf("column %q is written to every archive but is not in the recorded set %q", c.Name, got)
 		}
-	}
-}
-
-// Reading a stored value back. Empty in, NIL out: a row with no recorded set is
-// UNKNOWN, and a caller that took an empty slice for "a file with no columns"
-// would emit a read_parquet naming nothing at all.
-func TestSplitColumnSet_emptyMeansUnknown(t *testing.T) {
-	if got := SplitColumnSet(""); got != nil {
-		t.Errorf("SplitColumnSet(\"\") = %v, want nil", got)
-	}
-	if got := SplitColumnSet("   "); got != nil {
-		t.Errorf("SplitColumnSet(blank) = %v, want nil", got)
-	}
-	if got, want := SplitColumnSet("a,b"), []string{"a", "b"}; !reflect.DeepEqual(got, want) {
-		t.Errorf("SplitColumnSet = %v, want %v", got, want)
 	}
 }
 

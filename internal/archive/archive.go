@@ -76,14 +76,14 @@ type Stats struct {
 	MinEventTS time.Time
 	MaxEventTS time.Time
 	// Columns is the canonical column set of the file that was just written
-	// (#1535), for the caller to record in archive_state.columns. Reported by
+	// (#1535), for the caller to record in archive_state.column_set. Reported by
 	// the writer rather than read back off BinlogEventColumns at the call site
 	// so the record cannot drift from the bytes: a build that ever writes a
 	// narrower file records the narrower set.
 	Columns string
 }
 
-// ColumnSet renders a Parquet column list as the canonical archive_state.columns
+// ColumnSet renders a Parquet column list as the canonical archive_state.column_set
 // value: lowercase names, SORTED, comma-joined.
 //
 // Sorted, because it is a grouping KEY (#1535). Two files holding the same
@@ -113,15 +113,6 @@ func ColumnSetOf(names []string) string {
 	return strings.Join(lower, ",")
 }
 
-// SplitColumnSet reads a stored archive_state.columns value back. Empty in,
-// nil out: a row with no recorded set is UNKNOWN, and the caller must not treat
-// it as a file with no columns.
-func SplitColumnSet(s string) []string {
-	if strings.TrimSpace(s) == "" {
-		return nil
-	}
-	return strings.Split(s, ",")
-}
 
 // ArchivePartition writes all rows from the named partition of binlog_events
 // to a Parquet file at outputPath. The db must have been opened with
