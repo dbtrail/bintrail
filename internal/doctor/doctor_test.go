@@ -674,6 +674,12 @@ func TestCheckStatementCapture(t *testing.T) {
 			if tt.wantRemediation && got.Remediation == "" {
 				t.Error("expected remediation but got none")
 			}
+			// Enabling is NOT retroactive (#1437): only events written after
+			// the change carry text, so a remediation that omits this sends
+			// the operator to re-query a window that can never match.
+			if tt.wantRemediation && !strings.Contains(got.Remediation, "Not retroactive") {
+				t.Errorf("Remediation = %q, missing the non-retroactivity caveat", got.Remediation)
+			}
 			if got.Status == StatusFail {
 				t.Error("statement capture is optional — the check must never FAIL")
 			}

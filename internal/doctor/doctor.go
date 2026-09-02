@@ -594,7 +594,8 @@ func checkStatementCapture(ctx context.Context, db *sql.DB) CheckResult {
 			Status: StatusWarn,
 			Detail: "binlog_rows_query_log_events=OFF — events index without the originating SQL statement (query_text stays NULL)",
 			Remediation: "Optional: log the original statement with each row event so `bintrail query` can show it (dynamic, no restart; costs binlog bytes per statement):\n\n" +
-				"  SET PERSIST binlog_rows_query_log_events = ON;",
+				"  SET PERSIST binlog_rows_query_log_events = ON;\n\n" +
+				"Not retroactive: only events written AFTER the change carry text, so `query --query-hash` still matches nothing in the window before it (#1437).",
 		}
 	}
 	if !isUnknownVar(err) {
@@ -623,7 +624,8 @@ func checkStatementCapture(ctx context.Context, db *sql.DB) CheckResult {
 			Detail: "binlog_annotate_row_events=OFF — events index without the originating SQL statement (query_text stays NULL)",
 			Remediation: "Optional: log the original statement with each row event so `bintrail query` can show it (stream capture also needs `--source-flavor mariadb`):\n\n" +
 				"  SET GLOBAL binlog_annotate_row_events = ON;\n\n" +
-				"Persist it in my.cnf ([mysqld] binlog_annotate_row_events=ON) to survive restarts.",
+				"Persist it in my.cnf ([mysqld] binlog_annotate_row_events=ON) to survive restarts. " +
+				"Not retroactive: only events written AFTER the change carry text (#1437).",
 		}
 	}
 	if !isUnknownVar(err) {
