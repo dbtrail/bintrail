@@ -4059,7 +4059,7 @@ try {
     : bad("layout: a card left alone on the last row spans it", JSON.stringify(bandRow));
 
   // ── Scenario 17g3 — the disk-space card, every state it can be in ──
-  // Calls the REAL backupRefreshCard with each of the 96 DTOs the daemon can
+  // Calls the REAL backupRefreshCard with each of the 144 DTOs the daemon can
   // serve and reads the rendered element. A Go guard over the source can only
   // see that both `br.enabled` and `br.scheduled` appear somewhere in the
   // function, so inverting either condition survives it while the card tells
@@ -4082,7 +4082,11 @@ try {
           // the alarm must separate those, so undefined and 0 are distinct
           // values here, not one falsy case.
           for (const targets of [undefined, 0, 1]) {
-          for (const skipped of [0, 2]) {
+          // 0, 1 and 2: a predicate that agrees with "> 0" on {0, 2} but hides
+          // the note for a SINGLE skipped server survives a two-value axis, and
+          // one S3-only server is both the common deployment and the value a
+          // later pluralization edit is most likely to special-case.
+          for (const skipped of [0, 1, 2]) {
             const el = backupRefreshCard({ carry_forward_unchanged: on, enabled, scheduled, source,
               targets, skipped_s3_only: skipped });
             const t = el.innerText || el.textContent || "";
@@ -4147,7 +4151,7 @@ try {
     || r.skipPromisesReuse
     // the hand-it-back button appears only where there is something to hand back
     || (r.buttons.length === 2) !== (r.source === "override"));
-  cardStates.length === 96 && cardBad.length === 0
+  cardStates.length === 144 && cardBad.length === 0
     ? ok("backups: the disk-space card reports every state it can be in")
     : bad("backups: the disk-space card reports every state it can be in",
         JSON.stringify({ n: cardStates.length, wrong: cardBad.slice(0, 4) }));

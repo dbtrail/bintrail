@@ -88,6 +88,36 @@ func TestBaselineRefreshGet_targetsAreLiveAndOmittedOffWatch(t *testing.T) {
 		t.Fatalf("second read: %+v; the count is a boot snapshot, not live — a server added later would "+
 			"keep the stale zero and the alarm would cry wolf forever", got)
 	}
+
+	// The counts must survive an OVERRIDE, on the PUT response and on every
+	// read after it. They are appended after the override branch for exactly
+	// this reason, and the browser-side render matrix cannot see a server-side
+	// branch: an early return there makes the alarm and the skip note vanish
+	// the moment an operator uses this card's own switch.
+	//
+	// Decoded into a FRESH struct each time, never the one above: Unmarshal
+	// leaves a field the payload omits at its previous value, so reusing `got`
+	// would carry the pointer from the read before and the assertion would pass
+	// against a response that dropped the key.
+	rec, body := doServersReq(t, srv, "PUT", "/api/baseline-refresh", `{"carry_forward_unchanged":true}`)
+	if rec.Code != 200 {
+		t.Fatalf("PUT code=%d body=%s", rec.Code, body)
+	}
+	var put baselineRefreshDTO
+	if err := json.Unmarshal(body, &put); err != nil {
+		t.Fatal(err)
+	}
+	if put.Source != "override" || put.Targets == nil || put.SkippedS3Only != 2 {
+		t.Fatalf("PUT response: %+v (%s), want the override plus both counts", put, body)
+	}
+	_, body = doServersReq(t, srv, "GET", "/api/baseline-refresh", "")
+	var after baselineRefreshDTO
+	if err := json.Unmarshal(body, &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.Source != "override" || after.Targets == nil || after.SkippedS3Only != 2 {
+		t.Fatalf("read after the override: %+v (%s), want the override plus both counts", after, body)
+	}
 }
 
 // Enabled is the loop's boot-time liveness and must NOT be implied by the
