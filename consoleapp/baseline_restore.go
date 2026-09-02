@@ -51,10 +51,11 @@ func (s *baselineSupervisor) RestoreStatus(serverID string) console.BaselineStat
 func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 	defer s.recoverBaselineJob(baselineJobRestore, req.ServerID, req.ServerName)
 	started := time.Now().UTC()
-	tables, refused, carried, err := s.executeRestore(req)
+	tables, refused, reuse, err := s.executeRestore(req)
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
 		Kind: console.BaselineRunRestore, StartedAt: started.Format(time.RFC3339),
-		SnapshotTime: publishedSnapshotTime(req.At, err), Tables: tables, Refused: refused, Carried: carried,
+		SnapshotTime: publishedSnapshotTime(req.At, err), Tables: tables, Refused: refused,
+		Carried: reuse.reused, CarriedCopied: reuse.copied,
 	}, err)
 
 	s.mu.Lock()
@@ -64,7 +65,7 @@ func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 		st = &console.BaselineStatus{}
 		s.restores[req.ServerID] = st
 	}
-	applyFoldStatus(st, tables, refused, carried, err)
+	applyFoldStatus(st, tables, refused, reuse, err)
 	if err != nil {
 		// Warn, never Error: a refusal (gap, schema change) is the fail-closed
 		// contract working, and the operator picks another moment.
@@ -73,20 +74,21 @@ func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 		return
 	}
 	slog.Info("baseline restore: published", "server", req.ServerName, "id", req.ServerID,
-		"tables", tables, "reused", carried, "at", req.At.UTC().Format(time.RFC3339))
+		"tables", tables, "reused", reuse.reused, "reused_copied", reuse.copied,
+		"at", req.At.UTC().Format(time.RFC3339))
 }
 
 // executeRestore folds toward the chosen instant. The table list comes from
 // the snapshot FindBaseline will anchor on (newest at-or-before At), NOT the
 // newest snapshot overall: restoring to a moment before the newest snapshot
 // must fold the older snapshot's tables.
-func (s *baselineSupervisor) executeRestore(req console.BaselineRestoreRequest) (tables, refused, carried int, err error) {
+func (s *baselineSupervisor) executeRestore(req console.BaselineRestoreRequest) (tables, refused int, reuse reuseTally, err error) {
 	tableList, err := reconstruct.SnapshotTablesAt(s.ctx, req.BaselineDir, req.At)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("list the snapshot to restore from: %w", err)
+		return 0, 0, reuseTally{}, fmt.Errorf("list the snapshot to restore from: %w", err)
 	}
 	if len(tableList) == 0 {
-		return 0, 0, 0, fmt.Errorf("no backup exists at or before %s; a restore folds an existing backup forward, so pick a moment after your oldest backup", req.At.UTC().Format("2006-01-02 15:04:05"))
+		return 0, 0, reuseTally{}, fmt.Errorf("no backup exists at or before %s; a restore folds an existing backup forward, so pick a moment after your oldest backup", req.At.UTC().Format("2006-01-02 15:04:05"))
 	}
 	return s.foldSnapshot(restoreFoldRequest(req), req.At.UTC(), tableList)
 }

@@ -171,7 +171,7 @@ func TestBaselineRefreshNote_partitionsTheTables(t *testing.T) {
 func TestBackupRefreshWireNamesMatchTheFrontend(t *testing.T) {
 	js := readAsset(t, "app.js")
 
-	raw, err := json.Marshal(BaselineStatus{State: "succeeded", Tables: 3, Carried: 2})
+	raw, err := json.Marshal(BaselineStatus{State: "succeeded", Tables: 3, Carried: 2, CarriedCopied: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,13 @@ func TestBackupRefreshWireNamesMatchTheFrontend(t *testing.T) {
 		t.Fatalf("BaselineStatus no longer serialises a \"carried\" key (got %s); the console reads rf.carried "+
 			"and would silently stop showing reused tables", raw)
 	}
-	for _, ref := range []string{"rf.carried", "rst.carried"} {
+	// carried_copied is the honesty half of the pair (#1578): without it every
+	// reuse renders as a disk saving, including the copies that saved none.
+	if _, ok := wire["carried_copied"]; !ok {
+		t.Fatalf("BaselineStatus no longer serialises \"carried_copied\" (got %s); copied reuses would "+
+			"silently render as disk savings again", raw)
+	}
+	for _, ref := range []string{"rf.carried", "rst.carried", "rf.carried_copied", "rst.carried_copied", "run.carried_copied"} {
 		if !strings.Contains(js, ref) {
 			t.Errorf("app.js does not read %s, so the reused count never reaches the page", ref)
 		}

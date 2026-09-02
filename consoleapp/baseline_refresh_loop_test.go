@@ -553,29 +553,37 @@ func TestRefreshFoldConfig_carriesTheSettingAndKeepsGapsStrict(t *testing.T) {
 	}
 }
 
-// TestCountCarried: the reuse count is the only confirmation an operator gets
+// TestCountReuse: the reuse tally is the only confirmation an operator gets
 // that the opt-in did anything, so it is derived from the per-table reports and
 // never from the setting. Asking for reuse is not getting it: a table with
-// changes, with a capture gap, or on the S3 path is folded anyway.
-func TestCountCarried(t *testing.T) {
-	rep := func(carried bool) *reconstruct.TableReport {
-		return &reconstruct.TableReport{CarriedForward: carried}
+// changes, with a capture gap, or on the S3 path is folded anyway. The copied
+// half narrows further: a reuse that fell back to a byte copy saved no disk,
+// and folding it into the reused count is how the console came to confirm a
+// saving the daemon log denied (#1578).
+func TestCountReuse(t *testing.T) {
+	rep := func(carried, linked bool) *reconstruct.TableReport {
+		return &reconstruct.TableReport{CarriedForward: carried, CarriedByLink: linked}
 	}
 	cases := []struct {
 		name    string
 		reports []*reconstruct.TableReport
-		want    int
+		want    reuseTally
 	}{
-		{"nothing folded", nil, 0},
-		{"every table rewritten", []*reconstruct.TableReport{rep(false), rep(false)}, 0},
-		{"every table reused", []*reconstruct.TableReport{rep(true), rep(true), rep(true)}, 3},
-		{"mixed, which is the normal case", []*reconstruct.TableReport{rep(true), rep(false), rep(true)}, 2},
-		{"a nil report is not a reuse", []*reconstruct.TableReport{rep(true), nil}, 1},
+		{"nothing folded", nil, reuseTally{}},
+		{"every table rewritten", []*reconstruct.TableReport{rep(false, false), rep(false, false)}, reuseTally{}},
+		{"every table reused by link", []*reconstruct.TableReport{rep(true, true), rep(true, true), rep(true, true)}, reuseTally{reused: 3}},
+		{"mixed, which is the normal case", []*reconstruct.TableReport{rep(true, true), rep(false, false), rep(true, true)}, reuseTally{reused: 2}},
+		{"a nil report is not a reuse", []*reconstruct.TableReport{rep(true, true), nil}, reuseTally{reused: 1}},
+		{"a copied reuse counts in BOTH halves", []*reconstruct.TableReport{rep(true, false), rep(true, true)}, reuseTally{reused: 2, copied: 1}},
+		// CarriedByLink without CarriedForward is a shape fulltable.go never
+		// emits; if it ever appears, a link that was not a reuse must not
+		// subtract from anything.
+		{"linked-but-not-carried is not a reuse", []*reconstruct.TableReport{rep(false, true)}, reuseTally{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := countCarried(tc.reports); got != tc.want {
-				t.Errorf("countCarried = %d, want %d", got, tc.want)
+			if got := countReuse(tc.reports); got != tc.want {
+				t.Errorf("countReuse = %+v, want %+v", got, tc.want)
 			}
 		})
 	}
@@ -670,42 +678,45 @@ func TestEnvBoolOr(t *testing.T) {
 // and passed the whole suite, because the only caller needs a live index and a
 // real baseline.
 func TestFoldOutcome(t *testing.T) {
-	rep := func(carried bool) *reconstruct.TableReport {
-		return &reconstruct.TableReport{CarriedForward: carried}
+	rep := func(carried, linked bool) *reconstruct.TableReport {
+		return &reconstruct.TableReport{CarriedForward: carried, CarriedByLink: linked}
 	}
 	tables := []string{"shop.orders", "shop.users", "shop.audit"}
 
 	t.Run("clean run reports every table and the reused subset", func(t *testing.T) {
-		gotT, gotR, gotC, err := foldOutcome(tables,
-			[]*reconstruct.TableReport{rep(true), rep(false), rep(true)}, nil, nil)
+		// One of the two reuses is a COPY (no link), so the tally must carry
+		// both halves through this hop or the console's "saved no disk"
+		// qualifier never renders (#1578).
+		gotT, gotR, reuse, err := foldOutcome(tables,
+			[]*reconstruct.TableReport{rep(true, true), rep(false, false), rep(true, false)}, nil, nil)
 		if err != nil {
 			t.Fatalf("err = %v, want nil", err)
 		}
-		if gotT != 3 || gotR != 0 || gotC != 2 {
-			t.Errorf("tables=%d refused=%d carried=%d, want 3/0/2", gotT, gotR, gotC)
+		if gotT != 3 || gotR != 0 || reuse != (reuseTally{reused: 2, copied: 1}) {
+			t.Errorf("tables=%d refused=%d reuse=%+v, want 3/0/{reused:2 copied:1}", gotT, gotR, reuse)
 		}
 	})
 
 	t.Run("a clean run that reused nothing reports zero, not the total", func(t *testing.T) {
-		_, _, gotC, _ := foldOutcome(tables,
-			[]*reconstruct.TableReport{rep(false), rep(false), rep(false)}, nil, nil)
-		if gotC != 0 {
-			t.Errorf("carried=%d, want 0: every table was rewritten", gotC)
+		_, _, reuse, _ := foldOutcome(tables,
+			[]*reconstruct.TableReport{rep(false, false), rep(false, false), rep(false, false)}, nil, nil)
+		if reuse != (reuseTally{}) {
+			t.Errorf("reuse=%+v, want zero: every table was rewritten", reuse)
 		}
 	})
 
 	t.Run("a failed run still reports what the fold did", func(t *testing.T) {
 		want := errors.New("capture gap")
-		gotT, gotR, gotC, err := foldOutcome(tables,
-			[]*reconstruct.TableReport{rep(true)},
+		gotT, gotR, reuse, err := foldOutcome(tables,
+			[]*reconstruct.TableReport{rep(true, true)},
 			[]reconstruct.TableFailure{{}, {}}, want)
 		if !errors.Is(err, want) {
 			t.Fatalf("err = %v, want the run error", err)
 		}
 		// Publication is all-or-nothing, so nothing was published; the counts
 		// still describe the attempt, and refused comes from the failures.
-		if gotT != 3 || gotR != 2 || gotC != 1 {
-			t.Errorf("tables=%d refused=%d carried=%d, want 3/2/1", gotT, gotR, gotC)
+		if gotT != 3 || gotR != 2 || reuse != (reuseTally{reused: 1}) {
+			t.Errorf("tables=%d refused=%d reuse=%+v, want 3/2/{reused:1}", gotT, gotR, reuse)
 		}
 	})
 
@@ -727,15 +738,16 @@ func TestFoldOutcome(t *testing.T) {
 func TestApplyFoldStatus(t *testing.T) {
 	t.Run("a clean run reports every count and clears the previous error", func(t *testing.T) {
 		st := &console.BaselineStatus{State: "failed", LastError: "the previous run's gap"}
-		applyFoldStatus(st, 7, 0, 3, nil)
+		applyFoldStatus(st, 7, 0, reuseTally{reused: 3, copied: 2}, nil)
 		if st.State != "succeeded" {
 			t.Errorf("State = %q, want succeeded", st.State)
 		}
 		if st.LastError != "" {
 			t.Errorf("LastError = %q, want cleared: a stale error outlives the run that caused it", st.LastError)
 		}
-		if st.Tables != 7 || st.Refused != 0 || st.Carried != 3 {
-			t.Errorf("tables=%d refused=%d carried=%d, want 7/0/3", st.Tables, st.Refused, st.Carried)
+		if st.Tables != 7 || st.Refused != 0 || st.Carried != 3 || st.CarriedCopied != 2 {
+			t.Errorf("tables=%d refused=%d carried=%d copied=%d, want 7/0/3/2",
+				st.Tables, st.Refused, st.Carried, st.CarriedCopied)
 		}
 		if st.FinishedAt == "" {
 			t.Error("FinishedAt is empty, so the console cannot say when this ran")
@@ -744,7 +756,7 @@ func TestApplyFoldStatus(t *testing.T) {
 
 	t.Run("a failed run keeps the counts and names the error", func(t *testing.T) {
 		st := &console.BaselineStatus{State: "running"}
-		applyFoldStatus(st, 7, 2, 1, errors.New("capture gap at 2026-01-01T00:00:00Z"))
+		applyFoldStatus(st, 7, 2, reuseTally{reused: 1}, errors.New("capture gap at 2026-01-01T00:00:00Z"))
 		if st.State != "failed" {
 			t.Errorf("State = %q, want failed", st.State)
 		}
@@ -757,12 +769,14 @@ func TestApplyFoldStatus(t *testing.T) {
 	})
 
 	t.Run("reused zero is written, not skipped", func(t *testing.T) {
-		// The field is omitempty on the wire, so a stale non-zero left behind
-		// by the PREVIOUS run would keep rendering. Assignment, not accumulation.
-		st := &console.BaselineStatus{Carried: 9}
-		applyFoldStatus(st, 2, 0, 0, nil)
-		if st.Carried != 0 {
-			t.Errorf("Carried = %d, want 0: the previous run's reuse count survived into this one", st.Carried)
+		// Both fields are omitempty on the wire, so a stale non-zero left
+		// behind by the PREVIOUS run would keep rendering. Assignment, not
+		// accumulation.
+		st := &console.BaselineStatus{Carried: 9, CarriedCopied: 4}
+		applyFoldStatus(st, 2, 0, reuseTally{}, nil)
+		if st.Carried != 0 || st.CarriedCopied != 0 {
+			t.Errorf("Carried=%d CarriedCopied=%d, want 0/0: the previous run's reuse counts survived into this one",
+				st.Carried, st.CarriedCopied)
 		}
 	})
 }

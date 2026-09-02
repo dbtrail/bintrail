@@ -176,8 +176,12 @@ type BaselineStatus struct {
 	// ONLY confirmation the operator gets that the reuse setting did anything:
 	// without it a run that reused every file and a run that rewrote every
 	// file report identically.
-	Carried int   `json:"carried,omitempty"`
-	Rows    int64 `json:"rows,omitempty"`
+	Carried int `json:"carried,omitempty"`
+	// CarriedCopied narrows Carried to the reuses that fell back to a full
+	// byte copy (no hard link, so no disk saved). Without the split the UI
+	// confirmed a disk saving the daemon log denied (#1578).
+	CarriedCopied int   `json:"carried_copied,omitempty"`
+	Rows          int64 `json:"rows,omitempty"`
 	// Bytes is the finished artifact's on-disk weight (sql-export builds
 	// only) — the UI's download confirm and Ready line read it.
 	Bytes    int64 `json:"bytes,omitempty"`

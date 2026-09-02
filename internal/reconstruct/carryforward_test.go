@@ -65,12 +65,19 @@ func TestCarryForward_linksWhenItCanAndTheBytesSurvive(t *testing.T) {
 	}
 	dstSnap := filepath.Join(root, "new")
 
-	if err := carryForward(context.Background(), src, dstSnap, "demo", "orders"); err != nil {
+	linked, err := carryForward(context.Background(), src, dstSnap, "demo", "orders")
+	if err != nil {
 		t.Fatalf("carryForward: %v", err)
 	}
+	// The returned report must AGREE with the filesystem: the console renders
+	// it as "no disk saved" when false, so a link reported as a copy tells the
+	// operator the opposite of what happened (#1578).
+	if !linked {
+		t.Error("carryForward linked (the inodes below agree) but reported linked=false")
+	}
 	dst := filepath.Join(dstSnap, "demo", "orders.parquet")
-	// Compare INODES rather than a returned bool. The saving this exists for is
-	// the bytes not copied, and only the filesystem knows whether they were.
+	// Compare INODES rather than only the returned bool. The saving this exists
+	// for is the bytes not copied, and only the filesystem knows whether they were.
 	assertSharesInode(t, src, dst, "fell back to a copy inside one temp dir, where a hard link should succeed")
 	got, err := os.ReadFile(dst)
 	if err != nil {
@@ -142,8 +149,12 @@ func TestCarryForward_replacesALeftoverWithoutTruncatingASharedInode(t *testing.
 		t.Skipf("no hard links on this filesystem: %v", err)
 	}
 
-	if err := carryForward(context.Background(), src, dstSnap, "demo", "orders"); err != nil {
+	linked, err := carryForward(context.Background(), src, dstSnap, "demo", "orders")
+	if err != nil {
 		t.Fatalf("carryForward over a leftover: %v", err)
+	}
+	if !linked {
+		t.Error("the retry linked below but reported linked=false")
 	}
 	assertSharesInode(t, src, dst, "the retry fell back to a copy: without the unlink, os.Link fails on "+
 		"the leftover and the saving this exists for is silently lost")
@@ -179,7 +190,7 @@ func TestCarryForward_refusesAFileItsManifestDisagreesWith(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := carryForward(context.Background(), src, filepath.Join(root, "new"), "demo", "orders")
+	_, err := carryForward(context.Background(), src, filepath.Join(root, "new"), "demo", "orders")
 	if err == nil {
 		t.Fatal("carried a file forward that does not match its own manifest; a corrupt snapshot would " +
 			"be re-certified under the new snapshot's manifest and look healthy")
@@ -265,8 +276,14 @@ func TestCarryForward_copiesWhenItCannotLink(t *testing.T) {
 	linkFile = func(string, string) error { return syscall.EXDEV }
 
 	dstSnap := filepath.Join(root, "new")
-	if err := carryForward(context.Background(), src, dstSnap, "demo", "orders"); err != nil {
+	linked, err := carryForward(context.Background(), src, dstSnap, "demo", "orders")
+	if err != nil {
 		t.Fatalf("carryForward with links unavailable: %v", err)
+	}
+	// linked=false is what routes the console's "saved no disk" qualifier: a
+	// copy reported as a link is exactly the false saving #1578 closes.
+	if linked {
+		t.Error("the copy fallback reported linked=true, so the console would confirm a disk saving that never happened")
 	}
 	dst := filepath.Join(dstSnap, "demo", "orders.parquet")
 	got, err := os.ReadFile(dst)

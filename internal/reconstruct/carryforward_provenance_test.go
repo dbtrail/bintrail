@@ -82,7 +82,7 @@ func TestCarryForward_readsBackAsCarriedNotAsItsAncestor(t *testing.T) {
 	src := writeProvenanceSnapshot(t, root, oldStamp, baseline.ProducerReconstruct)
 
 	newDir := filepath.Join(root, newStamp)
-	if err := carryForward(context.Background(), src, newDir, "demo", "orders"); err != nil {
+	if _, err := carryForward(context.Background(), src, newDir, "demo", "orders"); err != nil {
 		t.Fatalf("carryForward: %v", err)
 	}
 	dst := filepath.Join(newDir, "demo", "orders.parquet")

@@ -255,6 +255,14 @@ type TableReport struct {
 	// and reading them as "the table is empty" would be wrong. See carryForward
 	// for why an untouched table's anchor stays valid.
 	CarriedForward bool
+	// CarriedByLink narrows CarriedForward to the arm that shares the
+	// previous file's inode — the only one that saves disk (#1578). A carried
+	// table with this false was published by a full COPY (no-link filesystem,
+	// a permission fault, or a cross-device output): still a reuse — no fold
+	// ran, no source was read — but every byte was written again, and a
+	// consumer that renders "reused" as a disk saving must count THIS, not
+	// CarriedForward, or it confirms a saving the daemon log denies.
+	CarriedByLink bool
 }
 
 // shouldWarnEvents reports whether a fetched event count should trigger the
@@ -1131,23 +1139,23 @@ func ReconstructTable(
 	// it returns the finding and lets the run proceed. See carryForwardEligible
 	// for why a known gap disqualifies a table from being carried at all.
 	if carryForwardEligible(cfg.CarryForwardUnchanged, cfg.OutputFormat, baselinePath, len(changes), capGap) {
-		cerr := carryForward(ctx, baselinePath, cfg.snapshotDir, schema, table)
+		linked, cerr := carryForward(ctx, baselinePath, cfg.snapshotDir, schema, table)
 		if cerr != nil {
 			return nil, fmt.Errorf("carry %s.%s forward unchanged: %w", schema, table, cerr)
 		}
 		rep.CarriedForward = true
+		rep.CarriedByLink = linked
 		// Relative to the snapshot dir, matching what mergeBaselineIntoParquet
 		// sets for a table it writes: one field cannot mean two things, and
 		// consumers join it themselves (internal/cli/drill.go does).
 		rep.Files = []string{filepath.Join(schema, table+".parquet")}
 		rep.Duration = time.Since(start)
-		// CarriedForward is set unconditionally above and deliberately does NOT
-		// distinguish a link from a copy: it means "published by reuse rather
-		// than by folding", which is true either way, and it is what the
-		// unchanged verdict and the console's reused count are derived from.
-		// carryForward logs the link-versus-copy split itself, with the cause.
+		// CarriedForward stays "published by reuse rather than by folding",
+		// true for the copy arm too; the link-versus-copy split rides
+		// CarriedByLink (#1578) so the console's disk claim can count only
+		// the arm that saved disk. carryForward logs the cause of a copy.
 		slog.Info("table carried forward unchanged", "schema", schema, "table", table,
-			"reason", "no events in the window")
+			"reason", "no events in the window", "linked", linked)
 		return rep, nil
 	}
 

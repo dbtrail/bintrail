@@ -436,6 +436,14 @@ func TestReconstructParquet_carriesForwardATableWithNoEvents(t *testing.T) {
 		t.Fatal("a table with no events in the window was folded and re-emitted; the rewrite it did not " +
 			"need is exactly the cost this avoids")
 	}
+	// One TempDir means one filesystem, so this reuse MUST be a hard link, and
+	// the report must say so: CarriedByLink is what the console's disk-saving
+	// claim counts (#1578), and the inode comparison below is what keeps this
+	// assertion honest rather than a copy of the code's own answer.
+	if !reports[0].CarriedByLink {
+		t.Error("a linked carry-forward reported CarriedByLink=false; the console would deny a disk " +
+			"saving the filesystem made")
+	}
 	if len(reports[0].Files) != 1 {
 		t.Fatalf("a carried-forward table published %d files, want 1", len(reports[0].Files))
 	}
@@ -457,6 +465,72 @@ func TestReconstructParquet_carriesForwardATableWithNoEvents(t *testing.T) {
 	dst := publishedUnder(t, root, reports[0].Files[0], src)
 	if a, b := carriedInode(t, src), carriedInode(t, dst); a != b {
 		t.Errorf("the carried file is a copy, not a link (inodes %d vs %d): the bytes were written again", a, b)
+	}
+}
+
+// The copy fallback through the REAL fold: same fixture as the test above with
+// the link primitive stubbed to fail, which is the only way the fold-level copy
+// arm ever executes on a one-filesystem test machine. The stake is the WIRING
+// in fulltable.go (`rep.CarriedByLink = linked`, not a constant): the unit test
+// on carryForward pins the function's answer, and without this test a hardcoded
+// `= true` at the call site would pass every tier while the console confirms a
+// disk saving for every copied reuse (#1578).
+func TestReconstructParquet_copiedCarryForwardReportsNoLink(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	db, dbName := testutil.CreateTestDB(t)
+	if err := indexer.CreateIndexTables(ctx, db, 48, false, nil); err != nil {
+		t.Fatalf("CreateIndexTables: %v", err)
+	}
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	const schema = "shop"
+	base := time.Now().UTC().Truncate(time.Hour)
+	seedOrdersSnapshot(t, db, schema, base)
+
+	root := t.TempDir()
+	seedSourceBaseline(t, root, base, schema)
+
+	// A neighbour keeps the window covered, same as the link-arm test.
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200,
+		base.Add(time.Minute).Format("2006-01-02 15:04:05"), nil,
+		schema, "customers", 1, "1", nil, nil, []byte(`{"id":1,"name":"n"}`))
+
+	restore := reconstruct.StubLinkFileForTest(func(string, string) error { return syscall.EXDEV })
+	defer restore()
+
+	reports, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
+		IndexDSN:              testutil.BaseDSN() + "/" + dbName,
+		BaselineSrc:           root,
+		Tables:                []string{schema + ".orders"},
+		At:                    base.Add(30 * time.Minute),
+		OutputDir:             root,
+		OutputFormat:          reconstruct.OutputFormatParquet,
+		CarryForwardUnchanged: true,
+	})
+	if err != nil {
+		t.Fatalf("ReconstructTables with links unavailable: %v", err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("got %d reports, want 1", len(reports))
+	}
+	// Still a reuse: the fold was skipped either way, and the copy arm is the
+	// designed fallback, not a failure.
+	if !reports[0].CarriedForward {
+		t.Fatal("the copy fallback stopped counting as a carry-forward; the fold ran for a table with no events")
+	}
+	if reports[0].CarriedByLink {
+		t.Error("a COPIED carry-forward reported CarriedByLink=true; the console would confirm a disk " +
+			"saving that never happened, which is the exact bug #1578 closes")
+	}
+	// The filesystem agrees: distinct inodes, so the report is measuring the
+	// publish, not echoing the setting.
+	src := filepath.Join(root, base.Format("2006-01-02T15-04-05Z"), schema, "orders.parquet")
+	dst := publishedUnder(t, root, reports[0].Files[0], src)
+	if a, b := carriedInode(t, src), carriedInode(t, dst); a == b {
+		t.Errorf("the stubbed link still shared an inode (%d): the stub never took, so this test pinned nothing", a)
 	}
 }
 

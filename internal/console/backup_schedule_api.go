@@ -67,7 +67,10 @@ type backupScheduleRunDTO struct {
 	Rows         int64  `json:"rows,omitempty"`
 	Uploaded     int    `json:"uploaded,omitempty"`
 	Carried      int    `json:"carried,omitempty"`
-	Refused      int    `json:"refused,omitempty"`
+	// CarriedCopied narrows Carried to full-byte-copy reuses (no disk saved)
+	// — see BaselineStatus.CarriedCopied.
+	CarriedCopied int `json:"carried_copied,omitempty"`
+	Refused       int `json:"refused,omitempty"`
 }
 
 type backupScheduleSkipDTO struct {
@@ -166,17 +169,18 @@ func (s *Server) backupScheduleDTO(ctx context.Context, e ServerEntry, now time.
 
 func scheduleRunFromRecord(run *BaselineRunRecord) *backupScheduleRunDTO {
 	return &backupScheduleRunDTO{
-		Method:       runMethod(run.Kind),
-		StartedAt:    run.StartedAt,
-		FinishedAt:   run.FinishedAt,
-		OK:           run.Error == "",
-		Error:        run.Error,
-		SnapshotTime: run.SnapshotTime,
-		Tables:       run.Tables,
-		Rows:         run.Rows,
-		Uploaded:     run.Uploaded,
-		Carried:      run.Carried,
-		Refused:      run.Refused,
+		Method:        runMethod(run.Kind),
+		StartedAt:     run.StartedAt,
+		FinishedAt:    run.FinishedAt,
+		OK:            run.Error == "",
+		Error:         run.Error,
+		SnapshotTime:  run.SnapshotTime,
+		Tables:        run.Tables,
+		Rows:          run.Rows,
+		Uploaded:      run.Uploaded,
+		Carried:       run.Carried,
+		CarriedCopied: run.CarriedCopied,
+		Refused:       run.Refused,
 	}
 }
 
@@ -198,17 +202,18 @@ func scheduleRunFromStatus(st BackupScheduleState) *backupScheduleRunDTO {
 		snapshot = cur.At
 	}
 	return &backupScheduleRunDTO{
-		Method:       st.LastMethod,
-		StartedAt:    st.LastStartedAt,
-		FinishedAt:   cur.FinishedAt,
-		OK:           ok,
-		Error:        cur.LastError,
-		SnapshotTime: snapshot,
-		Tables:       cur.Tables,
-		Rows:         cur.Rows,
-		Uploaded:     cur.Uploaded,
-		Carried:      cur.Carried,
-		Refused:      cur.Refused,
+		Method:        st.LastMethod,
+		StartedAt:     st.LastStartedAt,
+		FinishedAt:    cur.FinishedAt,
+		OK:            ok,
+		Error:         cur.LastError,
+		SnapshotTime:  snapshot,
+		Tables:        cur.Tables,
+		Rows:          cur.Rows,
+		Uploaded:      cur.Uploaded,
+		Carried:       cur.Carried,
+		CarriedCopied: cur.CarriedCopied,
+		Refused:       cur.Refused,
 	}
 }
 

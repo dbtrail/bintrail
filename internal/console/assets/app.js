@@ -4087,9 +4087,10 @@ function rotationCard(rot) {
 //
 // The saving also stopped being stated unconditionally. carryForward falls
 // back to a COPY when os.Link fails, and fulltable.go marks the table carried
-// either way, so the console reports "reused" for a run that saved nothing;
-// only the daemon log dissents. The guarantee the reader needs, that the
-// backup is still complete, is what stays absolute.
+// either way; carried_copied (#1578) carries the split to this page, and the
+// run notes qualify their "reused" counts with reusedCopiedNote so a run
+// that saved nothing no longer reads as a saving. The guarantee the reader
+// needs, that the backup is still complete, is what stays absolute.
 //
 // No command, flag or path appears in any visible string here. A reader
 // clicking buttons who is shown a flag is being told the real answer lives
@@ -4586,6 +4587,17 @@ function archivingPanel(servers, serversErr) {
   return panel;
 }
 
+// reusedCopiedNote qualifies a "reused" count with the reuses that were
+// written as full byte copies. The bare counter reads as a disk saving, and
+// for a copied reuse that saving did not happen: the fold was skipped but
+// every byte was written again (no hard link; the daemon log names the
+// cause). Confirming a saving the daemon log denies is the bug this splits
+// away (#1578).
+function reusedCopiedNote(copied) {
+  if (!copied) return "";
+  return " (" + copied + " of them written as full copies, which saved no disk; the daemon log says why)";
+}
+
 // baselineRefreshNote renders the last automatic refresh for the selected
 // server.
 function baselineRefreshNote(rf) {
@@ -4608,7 +4620,7 @@ function baselineRefreshNote(rf) {
       const rewritten = Math.max(0, (rf.tables || 0) - reused);
       text = "Automatic refresh" + (when ? " at " + when : "") + ": " +
         rewritten + " table(s) refreshed" +
-        (reused ? ", " + reused + " unchanged and reused" : "") + ".";
+        (reused ? ", " + reused + " unchanged and reused" + reusedCopiedNote(rf.carried_copied || 0) : "") + ".";
       break;
     case "failed":
       // published means the fold finished and marked the snapshot, and only
@@ -5648,7 +5660,7 @@ function backupScheduleCard(cur, b) {
         const reused = run.carried || 0;
         body.append(el("p", { class: "form-hint", text:
           "Last scheduled backup finished " + when + " (" + what + "): " + (run.tables || 0) + " table(s)" +
-          (reused ? ", " + reused + " unchanged and reused" : "") +
+          (reused ? ", " + reused + " unchanged and reused" + reusedCopiedNote(run.carried_copied || 0) : "") +
           (run.uploaded ? ", " + run.uploaded + " file(s) uploaded" : "") + "." }));
       } else {
         alarm = true;
@@ -5776,7 +5788,7 @@ function backupRestoreCard(cur, b, restoreSt) {
     // number nothing on this page confirms the setting did anything.
     body.append(el("p", { class: "form-hint", text:
       "Last restore finished" + (rst.at ? ": the backup at " + utcLabel(rst.at) : "") + " is in the list below." +
-      (rst.carried ? " " + rst.carried + " table(s) reused an unchanged file." : "") }));
+      (rst.carried ? " " + rst.carried + " table(s) reused an unchanged file" + reusedCopiedNote(rst.carried_copied || 0) + "." : "") }));
   }
   details.append(body);
   return details;

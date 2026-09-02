@@ -121,7 +121,7 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	// snapshot directory holds anything this run did not write, and once the
 	// fold has run its own files are in there too. See claimSnapshotDir.
 	unclaimed := claimSnapshotDir(refreshSnapshotDir(req, at))
-	tables, refused, carried, err := s.executeRefresh(req, at)
+	tables, refused, reuse, err := s.executeRefresh(req, at)
 	// Publishing is not finished until the snapshot is where this server's
 	// backups live. A fold that wrote a perfect local snapshot for a server
 	// whose destination is S3 has produced a copy on one box, which is not
@@ -146,7 +146,8 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	took := time.Since(elapsed)
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
 		Kind: console.BaselineRunRefresh, Trigger: req.Trigger, StartedAt: started.Format(time.RFC3339),
-		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused, Carried: carried,
+		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused,
+		Carried: reuse.reused, CarriedCopied: reuse.copied,
 		// Zero means "nothing was sent" for a server with no destination AND
 		// "these files reached the bucket" otherwise, so the count is what
 		// makes a successful upload visible at all: without it the only
@@ -168,7 +169,7 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 		st = &console.BaselineStatus{}
 		s.refreshes[req.ServerID] = st
 	}
-	applyFoldStatus(st, tables, refused, carried, err)
+	applyFoldStatus(st, tables, refused, reuse, err)
 	if err != nil {
 		// The refusal itself was already reported above, before this lock was
 		// taken. What happens HERE is deliberately nothing: no duration report.
@@ -181,7 +182,8 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 		// advice above the actual cause.
 		return
 	}
-	pub := []any{"server", req.ServerName, "id", req.ServerID, "tables", tables, "reused", carried}
+	pub := []any{"server", req.ServerName, "id", req.ServerID, "tables", tables,
+		"reused", reuse.reused, "reused_copied", reuse.copied}
 	// A reused count of zero reads as "nothing happened to be unchanged", which
 	// is indistinguishable from "this path cannot reuse anything" — and on an
 	// S3 source it is always the second (carryForwardEligible refuses any
@@ -514,11 +516,12 @@ func dirExists(path string) bool {
 // could reach them, and dropping the reused count from either copy compiled and
 // passed the whole suite. It is also the deduplication: two copies of a
 // four-field assignment is exactly how one of them silently loses a field.
-func applyFoldStatus(st *console.BaselineStatus, tables, refused, carried int, err error) {
+func applyFoldStatus(st *console.BaselineStatus, tables, refused int, reuse reuseTally, err error) {
 	st.FinishedAt = nowStamp()
 	st.Tables = tables
 	st.Refused = refused
-	st.Carried = carried
+	st.Carried = reuse.reused
+	st.CarriedCopied = reuse.copied
 	// Set on BOTH branches, never left from a previous run: this is what the
 	// scheduled watcher reads to decide whether a full backup is still owed,
 	// and a stale true there is a skipped backup.
@@ -550,7 +553,7 @@ func applyFoldStatus(st *console.BaselineStatus, tables, refused, carried int, e
 // OPPOSITE for Parallelism (zero means runtime.NumCPU()) and for
 // WarnEventThreshold (zero means the volume warning never fires). Those two are
 // therefore set explicitly in refreshFoldConfig; see the constants above it.
-func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (tables, refused, carried int, err error) {
+func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (tables, refused int, reuse reuseTally, err error) {
 	// Listed where the fold READS (refreshFoldConfig's BaselineSrc), not where
 	// it writes. On an S3-backed server those differ, and listing the local
 	// directory here would refuse with "no baseline snapshot" on exactly the
@@ -560,10 +563,10 @@ func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (t
 	src := baselineFoldSource(req)
 	tableList, err := newestSnapshotTables(s.ctx, src)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("list the snapshot to refresh: %w", err)
+		return 0, 0, reuseTally{}, fmt.Errorf("list the snapshot to refresh: %w", err)
 	}
 	if len(tableList) == 0 {
-		return 0, 0, 0, fmt.Errorf("no baseline snapshot to refresh under %s", src)
+		return 0, 0, reuseTally{}, fmt.Errorf("no baseline snapshot to refresh under %s", src)
 	}
 	return s.foldSnapshot(req, at, tableList)
 }
@@ -654,7 +657,18 @@ func refreshFoldConfig(req refreshRequest, at time.Time, tableList []string) rec
 	}
 }
 
-// countCarried counts the tables a fold published by reusing the previous
+// reuseTally counts one fold's carried tables, split by whether the bytes
+// were actually shared (#1578). reused is every table published by reuse
+// (the fold and the source read were saved either way); copied is the subset
+// written as a full copy because the file could not be hard linked — no disk
+// was saved for those, and a surface that renders "reused" as a disk saving
+// must subtract them or it confirms a saving the daemon log denies.
+type reuseTally struct {
+	reused int
+	copied int
+}
+
+// countReuse tallies the tables a fold published by reusing the previous
 // snapshot's file.
 //
 // A separate function for the same reason refreshFoldConfig is one: this is the
@@ -662,13 +676,16 @@ func refreshFoldConfig(req refreshRequest, at time.Time, tableList []string) rec
 // inside foldSnapshot nothing could reach it without standing up an index and a
 // baseline. Returning len(reports) here, or 0, compiles and passes every test
 // that does not call this directly.
-func countCarried(reports []*reconstruct.TableReport) (carried int) {
+func countReuse(reports []*reconstruct.TableReport) (tally reuseTally) {
 	for _, rep := range reports {
 		if rep != nil && rep.CarriedForward {
-			carried++
+			tally.reused++
+			if !rep.CarriedByLink {
+				tally.copied++
+			}
 		}
 	}
-	return carried
+	return tally
 }
 
 // foldSnapshot is the fold both the periodic refresh and the point-in-time
@@ -679,7 +696,7 @@ func countCarried(reports []*reconstruct.TableReport) (carried int) {
 // It is read out of the per-table reports rather than inferred from the
 // setting, because asking for reuse is not getting it: a table with changes,
 // with a capture gap, or on the S3 path is folded anyway.
-func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tableList []string) (tables, refused, carried int, err error) {
+func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tableList []string) (tables, refused int, reuse reuseTally, err error) {
 	reports, failures, runErr := foldTables(s.ctx, refreshFoldConfig(req, at, tableList))
 	return foldOutcome(tableList, reports, failures, runErr)
 }
@@ -737,12 +754,12 @@ var (
 // the equivalent end-to-end behaviour is pinned at the integration tier by
 // internal/reconstruct's TestReconstructParquet_doesNotCarryForwardUnlessAsked.
 func foldOutcome(tableList []string, reports []*reconstruct.TableReport,
-	failures []reconstruct.TableFailure, runErr error) (tables, refused, carried int, err error) {
-	carried = countCarried(reports)
+	failures []reconstruct.TableFailure, runErr error) (tables, refused int, reuse reuseTally, err error) {
+	reuse = countReuse(reports)
 	if runErr != nil {
-		return len(tableList), len(failures), carried, runErr
+		return len(tableList), len(failures), reuse, runErr
 	}
-	return len(tableList), 0, carried, nil
+	return len(tableList), 0, reuse, nil
 }
 
 // startBaselineRefreshLoop launches the opt-in periodic baseline refresh

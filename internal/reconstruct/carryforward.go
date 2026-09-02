@@ -99,16 +99,21 @@ import (
 // over it, which is a long way from here.
 var linkFile = os.Link
 
-func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table string) error {
+// carryForward reports HOW it published as well as whether it did: linked is
+// true only when the destination shares the source's inode, which is the only
+// arm that saves disk. The copy arm is still a reuse (no fold ran, no source
+// was read), but every byte was written again — collapsing the two is how the
+// console came to confirm a disk saving the daemon log denied (#1578).
+func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table string) (linked bool, err error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	if err := baselineintegrity.ValidateLocalFile(srcPath); err != nil {
-		return fmt.Errorf("validate the snapshot being carried forward: %w", err)
+		return false, fmt.Errorf("validate the snapshot being carried forward: %w", err)
 	}
 	dst := filepath.Join(snapshotDir, schema, table+".parquet")
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
+		return false, err
 	}
 	// Remove before writing, and the reason is the COPY path rather than the
 	// link path. os.Create truncates, and after a carry-forward the destination
@@ -117,11 +122,11 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 	// share before anything is written. (os.Link would also fail with EEXIST,
 	// though reconstruct's leftovers refusal already rules that out.)
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-		return err
+		return false, err
 	}
 	linkErr := linkFile(srcPath, dst)
 	if linkErr == nil {
-		return nil
+		return true, nil
 	}
 	// The copy is the designed fallback, not a failure, so the error is never
 	// returned. The LEVEL splits by cause, because the two causes are worlds
@@ -139,7 +144,7 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 			"Reusing an unchanged table is meant to avoid rewriting it; a copy still writes every byte.",
 			"src", srcPath, "dst", dst, "error", linkErr)
 	}
-	return copyFile(srcPath, dst)
+	return false, copyFile(srcPath, dst)
 }
 
 // carryForwardEligible reports whether a table can be published by carrying its

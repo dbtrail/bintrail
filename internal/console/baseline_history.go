@@ -58,11 +58,14 @@ type BaselineRunRecord struct {
 	// which the next run overwrites: whether a run cost a full rewrite is
 	// exactly the thing an operator looks back at when sizing a disk or an
 	// interval, and by then the live status is gone.
-	Carried  int    `json:"carried,omitempty"`
-	Rows     int64  `json:"rows,omitempty"`
-	Uploaded int    `json:"uploaded,omitempty"`
-	Refused  int    `json:"refused,omitempty"`
-	Error    string `json:"error,omitempty"`
+	Carried int `json:"carried,omitempty"`
+	// CarriedCopied narrows Carried to the reuses published as full byte
+	// copies (no hard link, no disk saved) — see BaselineStatus.CarriedCopied.
+	CarriedCopied int    `json:"carried_copied,omitempty"`
+	Rows          int64  `json:"rows,omitempty"`
+	Uploaded      int    `json:"uploaded,omitempty"`
+	Refused       int    `json:"refused,omitempty"`
+	Error         string `json:"error,omitempty"`
 }
 
 type baselineHistoryFile struct {
