@@ -175,6 +175,42 @@ func TestUploadWithOps_skipsViewsStagingLeftovers(t *testing.T) {
 	}
 }
 
+// An operator's own views.sql at the baselines ROOT (`bintrail views --out`)
+// is theirs to spell: its parent is no timestamp, so the gate passes it to
+// the plain copy with its original bytes. Without this, a later "always skip
+// a views.sql" simplification would silently stop uploading their file.
+func TestUploadWithOps_plainCopiesTheOperatorsRootViewsFile(t *testing.T) {
+	outputDir := uploadViewsFixture(t)
+	if err := os.WriteFile(filepath.Join(outputDir, SnapshotViewsName), []byte("-- OPERATOR file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	SetSnapshotViewsRespeller(func(_ context.Context, _, root string) (string, bool, error) {
+		return "-- RESPELLED under " + root, true, nil
+	})
+	t.Cleanup(func() { SetSnapshotViewsRespeller(nil) })
+	uploaded := map[string]string{}
+	ops := s3UploadOps{
+		putEmpty: func(_ context.Context, _ string) error { return nil },
+		uploadFile: func(_ context.Context, path, key string) error {
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			uploaded[key] = string(b)
+			return nil
+		},
+		objectExists: func(_ context.Context, _ string) (bool, error) { return false, nil },
+		deleteObject: func(_ context.Context, _ string) error { return nil },
+		objectURL:    func(key string) string { return "s3://bkt/" + key },
+	}
+	if _, err := uploadWithOps(context.Background(), outputDir, "p", false, ops); err != nil {
+		t.Fatalf("uploadWithOps: %v", err)
+	}
+	if got := uploaded["p/"+SnapshotViewsName]; got != "-- OPERATOR file" {
+		t.Fatalf("the root-level views file did not upload with its original bytes: %q", got)
+	}
+}
+
 func keys(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

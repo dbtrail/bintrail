@@ -732,8 +732,15 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("--   (no baseline source given: pass --baseline-dir or --baseline-s3)\n")
 	case len(in.Baselines) == 0:
 		fmt.Fprintf(b, "--   (none discoverable under %s)\n", in.BaselineSource)
-	case in.BaselineSource == ".":
+	case in.SnapshotScoped && in.BaselineSource == ".":
 		// The tarball's copy (#1583): paths spelled "./schema/table.parquet".
+		// Guarded by INTENT, not by the path value alone: `bintrail views
+		// --baseline-dir .` reaches this function with BaselineSource "." and
+		// SnapshotScoped false, and the tarball wording would misdescribe it
+		// three ways at once — "this archive" for a CLI file, a
+		// one-level-too-deep "run from inside" remediation, and a followed
+		// file stripped of the pointer line that separates it from a pinned
+		// one. Only snapshotViewsRelative pairs the dot root with the scope.
 		// Relative is the point — it survives being unpacked anywhere, moved
 		// later, or handed to someone else, because nothing inside names a
 		// place — and the price is stated with it: DuckDB resolves relative
