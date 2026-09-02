@@ -24,16 +24,17 @@ func expectGroupedArchiveSource(mock sqlmock.Sqlmock, id string) {
 			AddRow(id, nil, key("04"), "event_id"))
 }
 
-// The console serves BOTH consumers of this SQL from one builder: the SQL panel
-// binds these views in-process on every statement, and the download binds them
-// in the operator's DuckDB. So the grouping has to reach the console builder,
-// not only the CLI one.
+// The console writes this SQL for someone else to run: since #1554 removed the
+// SQL page, the whole wait it saves is the operator's, in whatever DuckDB they
+// open the downloaded file in. So the grouping has to reach the console builder
+// and not only the CLI one — two producers of the same artifact, and a test on
+// each is what keeps one of them from silently losing it.
 func TestViewsAPI_groupsTheArchiveLayout(t *testing.T) {
 	const id = "aaaa"
 	srv, mock := newLiveViewsServer(t, liveTestDSN)
 	expectGroupedArchiveSource(mock, id)
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, body)
 	}
@@ -48,8 +49,8 @@ func TestViewsAPI_groupsTheArchiveLayout(t *testing.T) {
 		t.Errorf("the two column sets were not joined:\n%s", sql)
 	}
 	// The narrow group must pad the column it lacks rather than name it: naming
-	// it is a binder error that defines no view, which on the SQL panel means
-	// the whole page fails rather than one column reading NULL.
+	// it is a binder error that defines no view at all — the reader's whole
+	// script fails rather than one column reading NULL.
 	if !strings.Contains(sql, `NULL AS "query_text"`) {
 		t.Errorf("the group without query_text does not pad it:\n%s", sql)
 	}
@@ -77,7 +78,7 @@ func TestViewsAPI_partialRegistryKeepsTheGlob(t *testing.T) {
 			AddRow(id, nil, key("03"), "event_id,query_text").
 			AddRow(id, nil, key("04"), nil))
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, body)
 	}

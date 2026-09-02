@@ -50,7 +50,7 @@ registry row each file implies, and diffs against archive_state:
                            which a local scan reads anyway and an S3 scan
                            reads only under --deep)
 
-The archived column set is what lets bintrail views and the console SQL panel
+The archived column set is what lets the DuckDB schema bintrail views writes
 read the layout one group per schema instead of opening every file's footer on
 every query (#1535). On an S3 archive that means --deep --repair: without
 --deep no remote footer is read, so the repair records nothing.

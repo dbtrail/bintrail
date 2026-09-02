@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **The `events` view binds one Parquet footer per SCHEMA, not per archived
   file** (#1535). `archive_state` gains `column_set`, the archived file's own
-  column set, and `bintrail views` / the console SQL panel now emit one
-  `read_parquet` per distinct set — each with an explicit file list and
+  column set, and `bintrail views` and the console's DuckDB-schema download now
+  emit one `read_parquet` per distinct set — each with an explicit file list and
   `union_by_name = false`, padding the columns a group lacks with `NULL` and
   joining the groups with `UNION ALL BY NAME`. A view re-binds on every
   statement, so what used to cost one footer read per archived file, forever
@@ -32,9 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   naming the command. The file list comes from the registry rather than a glob,
   so grouping a partial one would leave those partitions out of the view rather
   than merely slow to bind — and a listed file that is not there makes DuckDB
-  refuse the whole script, `events` and every state view with it. The console
-  SQL panel additionally retries over the whole layout if the grouped views do
-  not bind, so a registry fault degrades the panel to slow instead of blank.
+  refuse the whole script, `events` and every state view with it.
   **A grouped file does not follow the layout**: it names its archives
   explicitly, so partitions archived after it was generated are not in it. The
   header says which of the two forms the file uses; regenerate on the schedule
