@@ -351,6 +351,15 @@ func TestSchemaChangesTool_snapshotIDRoundTrip(t *testing.T) {
 	if !strings.Contains(text, `"snapshot_id": null`) {
 		t.Errorf("uncovered DDL must carry an explicit null snapshot_id, got:\n%s", text)
 	}
+	// The null row above is a TRUNCATE, the one ddl_type whose null is by
+	// design: without the note the same null means both "no snapshot taken"
+	// and "no snapshot needed" (#1436).
+	if !strings.Contains(text, `"snapshot_note": "no snapshot needed`) {
+		t.Errorf("a TRUNCATE's null snapshot_id carries no snapshot_note, so the null keeps two meanings:\n%s", text)
+	}
+	if strings.Count(text, "snapshot_note") != 1 {
+		t.Errorf("snapshot_note must appear on the TRUNCATE row only, got:\n%s", text)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
 	}
@@ -364,11 +373,16 @@ func TestSchemaChangesTool_uncoveredOnlyFilter(t *testing.T) {
 	defer db.Close()
 
 	detected := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
-	// The expectation only matches when the SQL carries the IS NULL predicate.
-	mock.ExpectQuery("FROM schema_changes WHERE 1=1 AND snapshot_id IS NULL ORDER BY detected_at DESC, binlog_file DESC, binlog_pos DESC, id DESC LIMIT").
+	// The expectation only matches when the SQL carries the STATUS package's
+	// predicate — IS NULL plus the TRUNCATE exclusion (#1436). A bare IS NULL
+	// here is the drift this pin exists to catch: the filter promises exactly
+	// the rows the status warning counts, and the two clauses diverged once
+	// (9 listed against a count of 1, the delta being TRUNCATEs whose null is
+	// by design).
+	mock.ExpectQuery(`FROM schema_changes WHERE 1=1 AND snapshot_id IS NULL AND ddl_type <> 'TRUNCATE TABLE' ORDER BY detected_at DESC, binlog_file DESC, binlog_pos DESC, id DESC LIMIT`).
 		WillReturnRows(sqlmock.NewRows(schemaChangesMockCols).
-			AddRow(2, detected, "shop", "orders", "TRUNCATE TABLE",
-				"TRUNCATE TABLE orders", "binlog.000001", 900, nil, nil))
+			AddRow(2, detected, "shop", "orders", "ALTER TABLE",
+				"ALTER TABLE orders ADD COLUMN note TEXT", "binlog.000001", 900, nil, nil))
 
 	res, _, err := MakeSchemaChangesTool(newSchemaChangesTarget(db))(context.Background(), nil, SchemaChangesArgs{UncoveredOnly: true})
 	if err != nil {

@@ -330,6 +330,18 @@ func LoadArchiveStats(ctx context.Context, db *sql.DB) (*ArchiveStats, error) {
 // and archive_state. Archive coverage is derived from partition names stored in
 // archive_state (e.g. "p_2026021914" → 2026-02-19 14:00 UTC) without reading
 // Parquet files.
+// UncoveredDDLWhere is the ONE definition of "a DDL with no covering
+// snapshot", shared by this package's UncoveredDDLs count and the
+// list_schema_changes tool's uncovered_only filter (#1436) — the two were
+// hand-maintained WHERE clauses and diverged once: the tool used a bare
+// `snapshot_id IS NULL` and listed 9 rows where the status warning counted 1.
+//
+// TRUNCATE TABLE is excluded: it does not change table structure, so every
+// capture path records it with snapshot_id = NULL on purpose ("DDL detected
+// (no snapshot needed)") — a NULL there is not a coverage gap, and counting
+// it would permanently inflate the warning.
+const UncoveredDDLWhere = `snapshot_id IS NULL AND ddl_type <> 'TRUNCATE TABLE'`
+
 func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
 	var c CoverageInfo
 	err := db.QueryRowContext(ctx, `
@@ -346,12 +358,8 @@ func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
 		return nil, fmt.Errorf("query schema_changes count: %w", err)
 	}
 
-	// TRUNCATE TABLE is excluded: it does not change table structure, so every
-	// capture path records it with snapshot_id = NULL on purpose ("DDL detected
-	// (no snapshot needed)") — a NULL there is not a coverage gap.
 	err = db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM schema_changes
-		 WHERE snapshot_id IS NULL AND ddl_type <> 'TRUNCATE TABLE'`).Scan(&c.UncoveredDDLs)
+		`SELECT COUNT(*) FROM schema_changes WHERE `+UncoveredDDLWhere).Scan(&c.UncoveredDDLs)
 	if err != nil {
 		return nil, fmt.Errorf("query uncovered DDLs: %w", err)
 	}

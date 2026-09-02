@@ -532,7 +532,7 @@ type SchemaChangesArgs struct {
 	// UncoveredOnly narrows results to DDLs with no covering snapshot — the
 	// rows the status tool's "N DDL(s) detected without auto-snapshot" warning
 	// counts, so an agent can go straight from that warning to the exact rows.
-	UncoveredOnly bool `json:"uncovered_only,omitempty" jsonschema:"Return only changes with no covering schema snapshot (snapshot_id is null); the ones counted by the status tool's uncovered-DDL warning"`
+	UncoveredOnly bool `json:"uncovered_only,omitempty" jsonschema:"Return only changes with no covering schema snapshot; exactly the ones counted by the status tool's uncovered-DDL warning. TRUNCATE TABLE rows are excluded like the warning excludes them: TRUNCATE changes no table structure, so no snapshot is needed and their null snapshot_id is by design. To list TRUNCATEs, drop this flag or filter ddl_type TRUNCATE"`
 }
 
 // rejectSurfaceParams enforces the surface's parameter policy: a non-nil
@@ -1108,7 +1108,12 @@ func MakeSchemaChangesTool(cfg Config) func(context.Context, *mcp.CallToolReques
 			params = append(params, *untilT)
 		}
 		if args.UncoveredOnly {
-			q += " AND snapshot_id IS NULL"
+			// The status package's predicate, verbatim: this filter promises
+			// "the ones counted by the status tool's uncovered-DDL warning",
+			// and a re-written clause here diverged once (#1436: a bare
+			// IS NULL listed the TRUNCATEs the warning deliberately excludes,
+			// 9 rows against a count of 1).
+			q += " AND " + status.UncoveredDDLWhere
 		}
 		// detected_at has one-second resolution and a migration lands dozens of
 		// DDLs inside one second, so the timestamp alone leaves the group in
@@ -1147,8 +1152,13 @@ func MakeSchemaChangesTool(cfg Config) func(context.Context, *mcp.CallToolReques
 			GTID       string `json:"gtid,omitempty"`
 			// SnapshotID is the auto-snapshot taken after this DDL. Deliberately
 			// NOT omitempty: an explicit null is the "uncovered DDL" signal the
-			// status tool's warning points at (#1050).
+			// status tool's warning points at (#1050) — except on TRUNCATE
+			// rows, where SnapshotNote says the null is by design (#1436).
 			SnapshotID *int64 `json:"snapshot_id"`
+			// SnapshotNote disambiguates the one ddl_type whose null
+			// snapshot_id means "no snapshot needed" rather than "no snapshot
+			// taken": without it the same null carries two opposite meanings.
+			SnapshotNote string `json:"snapshot_note,omitempty"`
 		}
 
 		var results []schemaChange
@@ -1166,6 +1176,11 @@ func MakeSchemaChangesTool(cfg Config) func(context.Context, *mcp.CallToolReques
 			}
 			if snapshotID.Valid {
 				sc.SnapshotID = &snapshotID.Int64
+			} else if sc.DDLType == "TRUNCATE TABLE" {
+				// The one null that is not a gap (#1436): every capture path
+				// records TRUNCATE with snapshot_id = NULL on purpose, and
+				// the status warning excludes it for the same reason.
+				sc.SnapshotNote = "no snapshot needed: TRUNCATE changes no table structure"
 			}
 			results = append(results, sc)
 		}

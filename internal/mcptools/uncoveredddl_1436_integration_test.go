@@ -1,0 +1,91 @@
+//go:build integration
+
+package mcptools
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/dbtrail/dbtrail/internal/status"
+	"github.com/dbtrail/dbtrail/internal/testutil"
+)
+
+// TestIntegrationUncoveredOnlyMatchesTheStatusCount pins the #1436
+// equivalence against a real index: the uncovered_only filter promises
+// "exactly the ones counted by the status tool's uncovered-DDL warning", and
+// the two predicates were hand-maintained WHERE clauses that diverged once
+// (a bare IS NULL listed 9 rows where the warning counted 1 — one genuinely
+// uncovered DDL plus eight TRUNCATEs whose null snapshot_id is by design).
+// Seeded: one covered DDL, one uncovered DDL, two TRUNCATEs. The count and
+// the row set must agree at 1, through the REAL query both sides run — the
+// shared status.UncoveredDDLWhere constant makes divergence structural, and
+// this test is what says the constant is actually what both execute.
+func TestIntegrationUncoveredOnlyMatchesTheStatusCount(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	insert := func(pos int, table, ddlType, stmt, snapshotID string) {
+		// positions distinct so the deterministic ORDER BY has real work
+		testutil.MustExec(t, db, fmt.Sprintf(`INSERT INTO schema_changes
+			(detected_at, binlog_file, binlog_pos, schema_name, table_name, ddl_type, ddl_query, snapshot_id)
+			VALUES ('2026-08-01 12:00:00', 'binlog.000001', %d, 'shop', '%s', '%s', '%s', %s)`,
+			pos, table, ddlType, stmt, snapshotID))
+	}
+	insert(100, "orders", "ALTER TABLE", "ALTER TABLE orders ADD COLUMN note TEXT", "7") // covered
+	insert(200, "users", "ALTER TABLE", "ALTER TABLE users DROP COLUMN tmp", "NULL")    // uncovered
+	insert(300, "orders", "TRUNCATE TABLE", "TRUNCATE TABLE orders", "NULL")            // null by design
+	insert(400, "users", "TRUNCATE TABLE", "TRUNCATE users", "NULL")                    // null by design
+
+	cov, err := status.LoadCoverage(context.Background(), db)
+	if err != nil {
+		t.Fatalf("LoadCoverage: %v", err)
+	}
+	if cov.UncoveredDDLs != 1 {
+		t.Fatalf("status counts %d uncovered DDLs, want 1 (the fixture's premise failed)", cov.UncoveredDDLs)
+	}
+
+	cfg := Config{Resolve: func(context.Context, string) (*Target, error) { return &Target{DB: db}, nil }}
+	res, _, err := MakeSchemaChangesTool(cfg)(context.Background(), nil, SchemaChangesArgs{UncoveredOnly: true})
+	if err != nil {
+		t.Fatalf("tool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool error: %s", resultText(res))
+	}
+	text := resultText(res)
+	end := strings.LastIndex(text, "]")
+	if end < 0 {
+		t.Fatalf("no JSON array in result: %s", text)
+	}
+	var rowsOut []map[string]any
+	if err := json.Unmarshal([]byte(text[:end+1]), &rowsOut); err != nil {
+		t.Fatalf("parse: %v\n%s", err, text)
+	}
+	if len(rowsOut) != cov.UncoveredDDLs {
+		t.Fatalf("uncovered_only returned %d rows against a status count of %d; the two surfaces "+
+			"describe the same set and an agent following the warning into the tool must not be "+
+			"contradicted", len(rowsOut), cov.UncoveredDDLs)
+	}
+	if got := rowsOut[0]["ddl_type"]; got != "ALTER TABLE" {
+		t.Errorf("the one uncovered row is %v, want the ALTER (a TRUNCATE here means the exclusion is gone)", got)
+	}
+
+	// The plain listing still carries the TRUNCATEs — nothing is hidden, the
+	// null just stops meaning two opposite things.
+	resAll, _, err := MakeSchemaChangesTool(cfg)(context.Background(), nil, SchemaChangesArgs{})
+	if err != nil {
+		t.Fatalf("tool (plain): %v", err)
+	}
+	allText := resultText(resAll)
+	if !strings.Contains(allText, "4 schema change(s)") {
+		t.Errorf("plain listing lost rows: %s", allText)
+	}
+	if strings.Count(allText, "no snapshot needed") != 2 {
+		t.Errorf("both TRUNCATE rows must carry the snapshot_note, got:\n%s", allText)
+	}
+}
+
