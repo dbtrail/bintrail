@@ -406,9 +406,9 @@ func TestBaselineTriggerPrecheck_sharedWithTheSchedule(t *testing.T) {
 		t.Fatal("fixture is runnable; the test needs a refused entry")
 	}
 	got := CheckBackupSchedule(e, BackupSchedule{Every: "1d"}, BackupScheduleGates{LoopRunning: true, FullBackups: true})
-	// The button's hint "(Edit → Advanced)" moves to the end of the combined
+	// The button's hint "(Backups & snapshots page)" moves to the end of the combined
 	// reason and appears once, not once per producer.
-	const hint = " (Edit → Advanced)"
+	const hint = " (Backups & snapshots page)"
 	reason := RefusalReason(got)
 	if got == nil || !strings.HasPrefix(reason, strings.TrimSuffix(want.Error(), hint)) {
 		t.Fatalf("schedule reason %v does not start with the button's %v", got, want)

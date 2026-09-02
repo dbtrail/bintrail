@@ -4316,8 +4316,16 @@ function backupServerRow(srv, readOnly) {
   if (src === "server") {
     where = "This server names its own backup location.";
   } else if (src === "default") {
+    // The daemon default backs the READ paths only. Create backup, restores
+    // and the schedule read the server's raw entry on purpose (the default is
+    // a shared store; folding this server's index onto another server's
+    // snapshots would publish a backup that belongs to neither, see
+    // baseline_trigger.go), so claiming the default "is in force" here told
+    // the operator their backups were covered when the write paths would
+    // refuse.
     const eff = srv.resolved_dir || srv.resolved_s3;
-    where = "Using the daemon default: " + eff + ". A value saved here replaces it for this server.";
+    where = "Using the daemon default: " + eff + ". It covers Time-travel, verification and .sql exports; " +
+      "backups, restores and the schedule need a value saved here for this server.";
   } else {
     where = "No backup location. Time-travel, restores and scheduled backups have nothing to read or write.";
   }
@@ -4719,7 +4727,7 @@ function baselineConfigHint(cur, serversErr) {
   if (cur.kind === "ephemeral") {
     return "Restart the daemon with --baseline-dir or --baseline-s3 (compose: BASELINE_DIR in .env).";
   }
-  return "Set Backup dir or S3 under Manage servers → Edit → Advanced.";
+  return "Set Backup dir or S3 on the Backups & snapshots page.";
 }
 
 function formatAge(hours) {
@@ -6374,7 +6382,7 @@ function verifyRegions(servers, opts) {
   control.append(help);
   if (!configured) {
     control.append(el("p", { class: "form-hint", text:
-      "No backup set up for this server yet. The two snapshot modes need one (Manage servers → Edit → Advanced, then create at least two snapshots). \"Check recovery inputs\" works without one: it only reads the index." }));
+      "No backup set up for this server yet. The two snapshot modes need one (Backups & snapshots page, then create at least two snapshots). \"Check recovery inputs\" works without one: it only reads the index." }));
   }
 
   // ── Region 2: what is running or just ran ──
