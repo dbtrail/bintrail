@@ -342,8 +342,13 @@ func warnSQLPanelRetired() {
 	if strings.TrimSpace(os.Getenv("BINTRAIL_CONSOLE_SQL_PANEL")) == "" {
 		return
 	}
+	// Page-neutral wording on purpose: one function warns for BOTH binaries,
+	// and the card lives on Backups under `watch` and on Connect only for the
+	// serve-only fallback (#1581) — naming a single page here sends half the
+	// operators to a page without the card.
 	slog.Warn("BINTRAIL_CONSOLE_SQL_PANEL is set but no longer does anything: " +
 		"the console SQL page and POST /api/sql were removed. Download a DuckDB schema " +
-		"from the Connect page and query the same Parquet in your own DuckDB. " +
+		"from the console's Backups page (Connect, on a read-only console) and query " +
+		"the same Parquet in your own DuckDB. " +
 		"Remove the variable; a future release stops reading it")
 }

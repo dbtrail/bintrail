@@ -121,7 +121,29 @@ func TestViewsFileIsNamedFromOneConstant(t *testing.T) {
 	if n := strings.Count(body, decl[1]); n != 1 {
 		t.Errorf("%q appears %d times outside a comment line; only its own declaration may spell "+
 			"it out. Everywhere else it must come from DUCKDB_VIEWS_FILE, or the Backups lane can "+
-			"promise a file Connect AI no longer produces", decl[1], n)
+			"promise a file the schema card no longer produces", decl[1], n)
+	}
+
+	// The card's CLASS has the same two-surface problem in the same file: the
+	// panel wears it, and the take-away lane's jump resolves it — through an
+	// `if (c)` null-guard, so a drift is a dead button with no error and no
+	// toast, not a crash. Same rule, same shape: one declaration, everything
+	// else through the constant.
+	cardDecl := regexp.MustCompile(`const DUCKDB_CARD_CLASS = "([^"]+)"`).FindStringSubmatch(js)
+	if cardDecl == nil {
+		t.Fatal("DUCKDB_CARD_CLASS is gone: the take-away lane resolves the card by that class, " +
+			"and two literals drift the first time the card is restyled")
+	}
+	if n := strings.Count(js, cardDecl[1]); n != 1 {
+		t.Errorf("%q appears %d times outside a comment line; only the DUCKDB_CARD_CLASS "+
+			"declaration may spell it out, or the lane's jump can resolve a class the card "+
+			"no longer wears", cardDecl[1], n)
+	}
+	for _, fn := range []string{"function duckdbPanel(", "function backupDuckLane("} {
+		if !strings.Contains(stripJSLineComments(functionBody(t, js, fn)), "DUCKDB_CARD_CLASS") {
+			t.Errorf("%s no longer goes through DUCKDB_CARD_CLASS; the card and the jump "+
+				"that targets it must share one spelling", fn)
+		}
 	}
 }
 

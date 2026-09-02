@@ -34,11 +34,21 @@ const SERVER_KEY = "bintrail_console_server";
 const ONBOARD_KEY = "bintrail_console_onboarded";
 
 // The generated DuckDB views file, named in two places that must not drift:
-// the Connect AI panel that produces it, and the Backups lane that sends a
-// reader there to get it. Shared rather than guarded -- a constant cannot
-// disagree with itself, and a test comparing two literals only reports the
-// drift after someone ships it.
+// the card that builds it (mounted on Backups by renderBaselines, with
+// buildConnect's serve-only fallback, #1581) and the take-away lane that
+// points a reader down the page to it. Shared rather than guarded -- a
+// constant cannot disagree with itself, and a test comparing two literals
+// only reports the drift after someone ships it.
 const DUCKDB_VIEWS_FILE = "views.sql";
+
+// The card's own class, shared by duckdbPanel (which wears it) and the
+// take-away lane's jump (which resolves it) -- the LOCATION analog of the
+// filename constant above, and for the same reason: two literals drift the
+// first time the card is restyled, and the jump's `if (c)` null-guard would
+// turn that drift into a dead button with no error and no toast. style.css
+// addresses the card by this class too, so renaming it is a three-surface
+// change however it is spelled.
+const DUCKDB_CARD_CLASS = "cn-dk";
 
 // Export columns. connection_id is INCLUDED (epic #701 D1 — no longer a
 // gated field on the events API; CSV mirrors the JSON view exactly).
@@ -889,13 +899,16 @@ function navigate(route, params, push = true) {
   // snapshot listing and the verification runner). Same treatment, so a
   // bookmark to either lands on Overview rather than an empty page.
   if ((route === "baselines" || route === "verification") && !capsCache.monitor) route = "overview";
-  // The SQL page was removed (#1549). Rewritten to Connect rather than to
-  // Overview, and rewritten rather than aliased, for the same reasons /storage
-  // is: the address bar stops naming a page that no longer exists, and the
-  // reader who bookmarked it wanted SQL over this Parquet — Connect is where
-  // the schema for their own DuckDB now lives, which Overview would not tell
-  // them.
-  if (route === "sql") { route = "connect"; history.replaceState({}, "", "/connect"); }
+  // The SQL page was removed (#1549). Rewritten rather than aliased, for the
+  // same reasons /storage is: the address bar stops naming a page that no
+  // longer exists, and the reader who bookmarked it wanted SQL over this
+  // Parquet — so land where the DuckDB schema card actually is (#1581):
+  // Backups when that page exists, Connect on the serve-only fallback. A
+  // fixed /connect target would send a watch reader to a page the card left.
+  if (route === "sql") {
+    route = capsCache.monitor ? "baselines" : "connect";
+    history.replaceState({}, "", "/" + route);
+  }
   const qs = params && Object.keys(params).length
     ? "?" + new URLSearchParams(params).toString() : "";
   if (push) history.pushState({ route }, "", "/" + route + qs);
@@ -4383,10 +4396,10 @@ function duckdbPanel() {
   // and bars are drawn in). On Backups every sibling panel is the same bare
   // section, so the shape needs no translation. The cn- class prefix is a
   // birthmark, not a location: style.css addresses the card by it.
-  const card = el("section", { class: "ov-panel cn-dk", style: "margin-top:18px" });
+  const card = el("section", { class: "ov-panel " + DUCKDB_CARD_CLASS, style: "margin-top:18px" });
   card.append(el("div", { class: "ov-panel-head" },
     el("h2", { class: "ov-panel-title", text: "Download a DuckDB schema" })));
-  const body = el("div", { class: "cn-dk-body" });
+  const body = el("div", { class: DUCKDB_CARD_CLASS + "-body" });
   card.append(body);
   const shape = duckdbShape();
   body.append(shape.el);
@@ -5812,8 +5825,8 @@ function backupTakeAway(cur, b, sqlSt) {
 }
 
 // backupFilesShape draws the count instead of stating it: on the DuckDB lane
-// two tiles when Connect AI can produce the views file and one when it
-// cannot, one on the MySQL lane. A reader who takes nothing else off
+// two tiles when the card below the list can produce the views file and one
+// when it cannot, one on the MySQL lane. A reader who takes nothing else off
 // this panel should still leave knowing that much. Built with el() and CSS
 // like duckdbShape(), never svgEl -- that path is for static icon constants.
 function backupFilesShape(files) {
@@ -5888,7 +5901,7 @@ function backupDuckLane(b) {
     // is motion, and this codebase spends motion only under the
     // prefers-reduced-motion discipline (#1392); a jump the reader asked for
     // needs no easing to be understood.
-    views.onclick = () => { const c = $(".cn-dk"); if (c) c.scrollIntoView(); };
+    views.onclick = () => { const c = $("." + DUCKDB_CARD_CLASS); if (c) c.scrollIntoView(); };
     go.append(views);
   }
   lane.append(go, msg);

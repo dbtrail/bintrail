@@ -2875,8 +2875,8 @@ button { font-family: inherit; }
 
 /* The drawing: one tile per DOWNLOAD, not per file -- the Parquet tile is a
    whole folder arriving as one .tar.gz, so counting files would be wrong by
-   hundreds. TWO on the DuckDB lane (when Connect AI can produce the views
-   file) and ONE on the
+   hundreds. TWO on the DuckDB lane (when the schema card below the list can
+   produce the views file, #1581) and ONE on the
    MySQL lane, and that count is the whole message -- it says "this takes two
    files" before any sentence does. Drawn with el() and these classes, never
    svgEl (that path is for static icon constants). */
