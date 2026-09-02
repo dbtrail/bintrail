@@ -9,7 +9,7 @@ func TestQueryResultNotice(t *testing.T) {
 	t.Run("ceiling supersedes the generic truncation notice", func(t *testing.T) {
 		// After a cap, n == limit (== ceiling), so the generic arm would also
 		// match; the ceiling message must win and must NOT say "increase the limit".
-		got := queryResultNotice(true, 5_000_000, 1_000_000, 1_000_000, 1_000_000)
+		got := queryResultNotice(true, 5_000_000, 1_000_000, 1_000_000, 1_000_000, "")
 		if !strings.Contains(got, "exceeds the MCP query ceiling") {
 			t.Errorf("want ceiling message, got %q", got)
 		}
@@ -22,7 +22,7 @@ func TestQueryResultNotice(t *testing.T) {
 	})
 
 	t.Run("generic truncation notice when not capped and full", func(t *testing.T) {
-		got := queryResultNotice(false, 100, 1_000_000, 100, 100)
+		got := queryResultNotice(false, 100, 1_000_000, 100, 100, "")
 		if !strings.Contains(got, "increase the limit") {
 			t.Errorf("want generic truncation notice, got %q", got)
 		}
@@ -31,8 +31,27 @@ func TestQueryResultNotice(t *testing.T) {
 		}
 	})
 
+	// The truncation notice names which END the trim kept (#1439): a client
+	// that asked for the last N must be able to tell whether the newest
+	// events survived the cut. Both directions asserted, and asserted
+	// disjoint, so swapping the arms cannot pass.
+	t.Run("truncation names the kept end per direction", func(t *testing.T) {
+		asc := queryResultNotice(false, 100, 1_000_000, 100, 100, "ASC")
+		if !strings.Contains(asc, "OLDEST") || strings.Contains(asc, "NEWEST") {
+			t.Errorf("ASC truncation must say it kept the OLDEST events: %q", asc)
+		}
+		empty := queryResultNotice(false, 100, 1_000_000, 100, 100, "")
+		if !strings.Contains(empty, "OLDEST") {
+			t.Errorf("the empty default is ASC and must say OLDEST: %q", empty)
+		}
+		desc := queryResultNotice(false, 100, 1_000_000, 100, 100, "desc")
+		if !strings.Contains(desc, "NEWEST") || strings.Contains(desc, "OLDEST") {
+			t.Errorf("DESC truncation (case-insensitive) must say it kept the NEWEST events: %q", desc)
+		}
+	})
+
 	t.Run("no notice below the limit", func(t *testing.T) {
-		if got := queryResultNotice(false, 100, 1_000_000, 42, 100); got != "" {
+		if got := queryResultNotice(false, 100, 1_000_000, 42, 100, "DESC"); got != "" {
 			t.Errorf("want empty notice for a partial result, got %q", got)
 		}
 	})

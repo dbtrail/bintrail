@@ -349,8 +349,8 @@ func applyQueryCeiling(limit, max int) (int, bool) {
 	return mcptools.ApplyQueryCeiling(limit, max)
 }
 
-func queryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit int) string {
-	return mcptools.QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, limit)
+func queryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit int, order string) string {
+	return mcptools.QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, limit, order)
 }
 
 func buildQueryOptions(p mcptools.FilterParams, defaultLimit int) (query.Options, error) {

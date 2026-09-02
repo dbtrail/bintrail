@@ -255,6 +255,87 @@ func TestQueryTool_noResults(t *testing.T) {
 	}
 }
 
+// TestQueryTool_orderDescKeepsTheNewest is #1439's contract end to end: under
+// order=DESC a truncating limit keeps the NEWEST matching events, returned
+// newest-first, and the truncation warning names the end it kept. Three
+// events and limit 2, so the assertion discriminates: the ASC default would
+// answer with the two OLDEST (ids 1,2) and the warning would say OLDEST.
+func TestQueryTool_orderDescKeepsTheNewest(t *testing.T) {
+	db, _, dsn := setupTestDB(t)
+	ctx := context.Background()
+
+	for i, ts := range []string{"2026-02-19 10:00:00", "2026-02-19 10:01:00", "2026-02-19 10:02:00"} {
+		testutil.InsertEvent(t, db, "mysql-bin.000001", uint64(100*(i+1)), uint64(100*(i+2)), ts, nil,
+			"mydb", "orders", 1, fmt.Sprintf("%d", i+1), nil, nil,
+			[]byte(fmt.Sprintf(`{"id":%d}`, i+1)))
+	}
+
+	session := connectMCP(t)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "query",
+		Arguments: map[string]any{
+			"index_dsn": dsn,
+			"schema":    "mydb",
+			"table":     "orders",
+			"format":    "json",
+			"order":     "DESC",
+			"limit":     2,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("tool error: %s", callToolText(t, result))
+	}
+	text := callToolText(t, result)
+
+	// The JSON body ends at the closing bracket; the warning is appended text.
+	end := strings.LastIndex(text, "]")
+	if end < 0 {
+		t.Fatalf("no JSON array in result: %s", text)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(text[:end+1]), &rows); err != nil {
+		t.Fatalf("parse JSON: %v\ntext: %s", err, text)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+	if pk0, pk1 := rows[0]["pk_values"], rows[1]["pk_values"]; pk0 != "3" || pk1 != "2" {
+		t.Errorf("DESC page = pks %v,%v; want 3,2 (newest first, newest kept)", pk0, pk1)
+	}
+	if !strings.Contains(text, "NEWEST") {
+		t.Errorf("truncation warning does not name the kept end: %s", text)
+	}
+}
+
+// A typo must refuse, never silently answer ascending: OrderDirection treats
+// anything but DESC as ASC, so without the boundary check "descending" would
+// return the OLDEST rows to a client that asked for the newest.
+func TestQueryTool_invalidOrder(t *testing.T) {
+	_, _, dsn := setupTestDB(t)
+	ctx := context.Background()
+
+	session := connectMCP(t)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "query",
+		Arguments: map[string]any{
+			"index_dsn": dsn,
+			"order":     "descending",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected IsError for invalid order, got: %s", callToolText(t, result))
+	}
+	if !strings.Contains(callToolText(t, result), "must be ASC or DESC") {
+		t.Errorf("refusal does not name the valid values: %s", callToolText(t, result))
+	}
+}
+
 func TestQueryTool_invalidFormat(t *testing.T) {
 	_, _, dsn := setupTestDB(t)
 	ctx := context.Background()

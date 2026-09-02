@@ -473,6 +473,7 @@ type QueryArgs struct {
 	Flag          string   `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
 	Format        string   `json:"format,omitempty" jsonschema:"Output format: json table or csv (default: json)"`
 	Limit         int      `json:"limit,omitempty" jsonschema:"Maximum number of events to return (default: 100)"`
+	Order         string   `json:"order,omitempty" jsonschema:"Sort direction: ASC (default) or DESC. Under ASC results return oldest-first and a truncating limit keeps the OLDEST matching events; under DESC newest-first and limit keeps the NEWEST. For 'the last N events' use DESC with limit N instead of guessing a since window."`
 	Profile       string   `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
 	NoArchive     bool     `json:"no_archive,omitempty" jsonschema:"Disable auto-routing to Parquet archives (MySQL-only results)"`
 }
@@ -613,6 +614,18 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 		}
 		opts.QueryHash = queryHash
 
+		// Order is set after BuildQueryOptions for the same reason as
+		// query_hash: the recover tool shares that builder and pins its own
+		// Order=DESC (#785/#927 — a truncated reversal must keep the newest
+		// events), so the parameter must not exist there. Validated at the
+		// boundary because OrderDirection treats garbage as ASC: a client
+		// typo like "descending" would silently answer with the oldest rows,
+		// the exact wrong end for the question DESC exists to ask (#1439).
+		if args.Order != "" && !strings.EqualFold(args.Order, "ASC") && !strings.EqualFold(args.Order, "DESC") {
+			return ErrorResult(fmt.Errorf("invalid order %q; must be ASC or DESC", args.Order)), nil, nil
+		}
+		opts.Order = args.Order
+
 		// Hard ceiling on an explicit, oversized limit (#654). BuildQueryOptions
 		// already coerces limit<=0 to the default, so this only bounds a large
 		// EXPLICIT value an agent might pass. It is applied here, per-tool, on the
@@ -727,7 +740,7 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 		if n > 0 && format != "json" {
 			text += fmt.Sprintf("\n%d row(s)\n", n)
 		}
-		text += QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, opts.Limit)
+		text += QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, opts.Limit, opts.Order)
 		text += ArchiveSkipNotice(discoveryFailed, skippedArchives)
 		text += EventDivergenceNotice(divergedEvents)
 		if misfiledScanFailed {
@@ -1291,13 +1304,21 @@ func ApplyQueryCeiling(limit, max int) (int, bool) {
 // telling an agent to "increase the limit" would be wrong, since the limit it
 // asked for is exactly the one that was capped (and after a cap n == limit makes
 // the generic arm true too, so order matters). Returns "" when no notice applies.
-func QueryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit int) string {
+func QueryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit int, order string) string {
 	switch {
 	case ceilingApplied:
 		return fmt.Sprintf("\nWarning: requested limit %d exceeds the MCP query ceiling of %d rows; capped to %d. "+
 			"Narrow your filters/time range, or run the `bintrail query` CLI for an unbounded export.\n", requestedLimit, ceiling, ceiling)
 	case n >= limit:
-		return fmt.Sprintf("\nWarning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", limit)
+		// The direction names which END the trim kept (#1439): "truncated"
+		// alone left a client that asked for the last N unable to tell
+		// whether the newest events survived the cut or fell off it.
+		kept, dropped := "OLDEST", "newer"
+		if query.OrderDirection(order) == "DESC" {
+			kept, dropped = "NEWEST", "older"
+		}
+		return fmt.Sprintf("\nWarning: results truncated at %d rows, keeping the %s matching events; %s ones were dropped. "+
+			"Use a narrower since/until range or increase the limit to see more.\n", limit, kept, dropped)
 	}
 	return ""
 }

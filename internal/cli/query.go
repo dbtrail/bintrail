@@ -430,7 +430,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
 		}
 		if n >= qLimit {
-			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", qLimit)
+			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows, keeping the %s matching events. Use a narrower time range or --limit to adjust.\n", qLimit, truncationKeptEnd(qOrder))
 		}
 		return nil
 	}
@@ -512,7 +512,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
 	}
 	if n >= qLimit {
-		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", qLimit)
+		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows, keeping the %s matching events. Use a narrower time range or --limit to adjust.\n", qLimit, truncationKeptEnd(qOrder))
 	}
 	// An empty digest-filtered result means one of two opposite things. Probe
 	// only here — after the answer came back empty — so the cost lands on the
@@ -586,6 +586,17 @@ func runQuery(cmd *cobra.Command, args []string) error {
 // tests drive the real loop body with a fake fetcher — no DuckDB, no real
 // database, and the exact same code path that production hits. Similarly
 // stderr is an io.Writer so tests capture into a bytes.Buffer without
+// truncationKeptEnd names which end of the matched window a truncating
+// --limit kept, for the stderr warning (#1439): under DESC the newest events
+// survive the cut, under ASC (or the empty default) the oldest do, and
+// "truncated" alone left the reader unable to tell which.
+func truncationKeptEnd(order string) string {
+	if query.OrderDirection(order) == "DESC" {
+		return "NEWEST"
+	}
+	return "OLDEST"
+}
+
 // touching os.Stderr.
 //
 // Stderr messages are sanitized against every line-terminator character via

@@ -44,7 +44,6 @@ var recoverCLIOnly = map[string]string{
 
 // queryCLIOnly is the same ledger for `bintrail query` vs the MCP query tool.
 var queryCLIOnly = map[string]string{
-	"order":               "sort-direction of the returned page (#1511); the MCP tool keeps the pre-#1511 ascending default",
 	"archive-dir":         "explicit archive source override; the MCP surface uses env config + archive_state auto-discovery",
 	"archive-s3":          "explicit archive source override; the MCP surface uses env config + archive_state auto-discovery",
 	"bintrail-id":         "companion to the explicit archive source flags above",
