@@ -131,6 +131,6 @@ func (s *baselineSupervisor) recoverBaselineJob(kind baselineJobKind, serverID, 
 	// progress to the status API ({state:"failed", rows:12000} looks
 	// half-done). Same reasoning the sql export's ordinary failure path
 	// spells out. Since and At are kept — they identify the run.
-	st.Tables, st.Refused, st.Carried, st.Uploaded = 0, 0, 0, 0
+	st.Tables, st.Refused, st.Carried, st.CarriedCopied, st.Uploaded = 0, 0, 0, 0, 0
 	st.Rows, st.Bytes = 0, 0
 }

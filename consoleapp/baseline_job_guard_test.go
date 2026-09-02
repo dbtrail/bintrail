@@ -241,6 +241,34 @@ func TestRecoverBaselineJob_doesNotRewriteAFinishedRun(t *testing.T) {
 	}
 }
 
+// TestRecoverBaselineJob_reportsNothingFromAPanickedRun: "nothing was
+// published, so report nothing" is the guard's own comment, and it holds only
+// while the zeroing list enumerates EVERY count on BaselineStatus. The counts
+// here are seeded on a running slot precisely because production never writes
+// them there today: the day something does, a field missing from the list
+// leaks a partial count next to state:"failed" — the shape the comment calls
+// half-done — and carried_copied surviving while carried is zeroed is a wire
+// shape no consumer expects (copied > reused).
+func TestRecoverBaselineJob_reportsNothingFromAPanickedRun(t *testing.T) {
+	sup := newBaselineSupervisor(context.Background(), t.TempDir(), baseline.DefaultLockMode)
+	sup.refreshes["a"] = &console.BaselineStatus{State: "running", Since: nowStamp(),
+		Tables: 7, Refused: 1, Carried: 3, CarriedCopied: 2, Uploaded: 4, Rows: 12000, Bytes: 5}
+
+	func() {
+		defer sup.recoverBaselineJob(baselineJobRefresh, "a", "srv")
+		panic("raised mid-run with counts on the slot")
+	}()
+
+	got := sup.RefreshStatus("a")
+	if got.State != "failed" {
+		t.Fatalf("state = %q, want failed", got.State)
+	}
+	if got.Tables != 0 || got.Refused != 0 || got.Carried != 0 || got.CarriedCopied != 0 ||
+		got.Uploaded != 0 || got.Rows != 0 || got.Bytes != 0 {
+		t.Fatalf("counts survived the panic guard: %+v; a partial count reads as progress", got)
+	}
+}
+
 // TestRecoverBaselineJob_passesThroughWithoutAPanic: the guard runs on the
 // success path of every job too, and must be inert there.
 func TestRecoverBaselineJob_passesThroughWithoutAPanic(t *testing.T) {
