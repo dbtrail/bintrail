@@ -59,14 +59,25 @@ type coverageResponse struct {
 	// or the session is profile-restricted.
 	FullTableStatus string `json:"full_table_status,omitempty"`
 	// FullTableFrom: from this instant onwards every table WITH A USABLE
-	// baseline is fully reconstructable (the latest usable newest-per-table
-	// anchor). Tables in broken_tables are excluded — they are not
-	// reconstructable at all; never-baselined tables are invisible here.
+	// LOCAL baseline is fully reconstructable (the latest usable
+	// newest-per-table anchor). Tables in broken_tables are excluded — they
+	// are not reconstructable at all — as are those in offsite_tables, whose
+	// anchor the Restore button cannot open; never-baselined tables are
+	// invisible here.
 	// Omitted when full_table_status != "ok" or no usable baseline exists.
 	FullTableFrom string `json:"full_table_from,omitempty"`
 	// BrokenTables: tables whose NEWEST baseline predates the delta floor —
 	// full-table restore through that hole is impossible (#1193's verdict).
 	BrokenTables []string `json:"broken_tables,omitempty"`
+	// OffsiteTables: tables whose only usable baseline lives in the S3
+	// destination, which this card's neighbouring Restore button cannot open.
+	//
+	// Its own bucket rather than broken_tables: broken drives an alarm, and a
+	// backup that exists off site is not broken. Its own bucket rather than
+	// silence, too — the listing behind this verdict reads every location
+	// (#1571), but the restore path does not (#1541), so folding these into
+	// full_table_from would promise a restore the button cannot perform.
+	OffsiteTables []string `json:"offsite_tables,omitempty"`
 }
 
 // tableAnchors holds the two baseline anchors of one table, which answer two
@@ -83,15 +94,24 @@ type coverageResponse struct {
 // window by however long ago the last baseline ran, and got worse the more
 // diligently an operator snapshotted: every new baseline pushed the reported
 // floor forward (#1294).
+//
+// earliestUsableLocal is the same anchor restricted to files under the local
+// backup directory, which is what full_table_from is reported from. The two
+// differ because the listing behind this card reads every configured location
+// (#1571) while the Restore button beside it folds from BaselineDir alone
+// (#1541): reconstruct and time-travel DO reach the bucket through
+// bundle.findBaseline (#766), so an offsite anchor is real coverage — it just
+// cannot be the number printed next to a button that will refuse it.
 type tableAnchors struct {
-	newest         time.Time
-	earliestUsable time.Time
+	newest              time.Time
+	earliestUsable      time.Time
+	earliestUsableLocal time.Time
 }
 
 // observe folds one baseline file's anchor in, with the verdict already graded
 // against the delta floor. Usable means at or above the floor — ok and aging
 // both qualify; aging says the window is shrinking, not that it is gone.
-func (a *tableAnchors) observe(ts time.Time, v status.BaselineStalenessVerdict) {
+func (a *tableAnchors) observe(ts time.Time, v status.BaselineStalenessVerdict, local bool) {
 	if ts.After(a.newest) {
 		a.newest = ts
 	}
@@ -100,7 +120,81 @@ func (a *tableAnchors) observe(ts time.Time, v status.BaselineStalenessVerdict) 
 		if a.earliestUsable.IsZero() || ts.Before(a.earliestUsable) {
 			a.earliestUsable = ts
 		}
+		if local && (a.earliestUsableLocal.IsZero() || ts.Before(a.earliestUsableLocal)) {
+			a.earliestUsableLocal = ts
+		}
 	}
+}
+
+// fullTableVerdict is the full-table half of the coverage card, decided from a
+// baseline listing and the delta floor.
+type fullTableVerdict struct {
+	from        time.Time
+	broken      []string
+	offsite     []string
+	unevaluable bool
+}
+
+// gradeFullTable folds a merged baseline listing into that verdict.
+//
+// Pure, and separated from the handler for one reason the handler cannot give
+// a test: an s3:// location is not listable from a unit test, so driving the
+// endpoint can only ever produce local anchors, and the whole point of the
+// local/offsite split is what happens when an anchor is NOT local. Taking the
+// files as an argument is what lets a test state that shape at all.
+//
+// Graded THROUGH the floor, never against its hour alone: on a multi-source
+// index the hour is the live floor and an anchor below it is unattributable,
+// not broken (#1219). Grading with the bare hour would name healthy tables in
+// broken, the false alarm the floor's own narrowing exists to avoid.
+func gradeFullTable(files []reconstruct.BaselineFile, floor status.DeltaFloor, now time.Time) fullTableVerdict {
+	anchors := make(map[string]*tableAnchors, len(files))
+	for _, f := range files {
+		k := f.Schema + "." + f.Table
+		a := anchors[k]
+		if a == nil {
+			a = &tableAnchors{}
+			anchors[k] = a
+		}
+		// A file present in BOTH locations kept its LOCAL path in the merge,
+		// so the kind of the path is the kind of the best copy available.
+		a.observe(f.SnapshotTime, floor.Grade(f.SnapshotTime, now), baselineKindOf(f.Path) == "dir")
+	}
+
+	var v fullTableVerdict
+	for k, a := range anchors {
+		if !a.earliestUsableLocal.IsZero() {
+			// The window covering ALL usable tables starts at the LATEST of
+			// their individual starts — and a table's own start is its
+			// EARLIEST usable anchor, not its newest (see tableAnchors).
+			if a.earliestUsableLocal.After(v.from) {
+				v.from = a.earliestUsableLocal
+			}
+			continue
+		}
+		if !a.earliestUsable.IsZero() {
+			// Usable, but only from the bucket. Named, not folded into the
+			// window and not called broken: the fold behind the Restore button
+			// reads the local directory only (#1541), so counting this anchor
+			// would print a start the button then refuses, while broken drives
+			// an alarm a backup that exists off site does not deserve.
+			v.offsite = append(v.offsite, k)
+			continue
+		}
+		// No usable anchor at all: the newest one says which kind of nothing
+		// this is.
+		if floor.Grade(a.newest, now) == status.BaselineBroken {
+			v.broken = append(v.broken, k)
+			continue
+		}
+		// Neither broken nor usable: it must not join broken AND must not
+		// define the window, or "ok" would assert restorability from an anchor
+		// whose coverage is unknown.
+		v.unevaluable = true
+	}
+	sort.Strings(v.broken)
+	sort.Strings(v.offsite)
+	return v
 }
 
 // serverID labels log lines with the request's selected server — a
@@ -164,64 +258,32 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 		// would be graded as if it were gone, and the panel would report a
 		// shorter restorable window than the one that exists.
 		merged := listBaselinesMerged(r.Context(), baselineSourcesOf(b), reconstruct.ListBaselines)
-		// ANY location that did not answer makes the verdict unknown, not just
+		// ANY location that FAILED TO LIST makes the verdict unknown, not just
 		// all of them. A partial listing can only understate coverage, and an
 		// understated coverage window names healthy tables as broken -- the
 		// cry-wolf failure status.DeltaFloor already refuses when archives
 		// cannot be attributed. Unknown is the honest third state.
+		//
+		// Bounded deliberately at whole-location failures: listBaselinesLocal
+		// warns and skips a snapshot subdirectory it cannot read and returns a
+		// nil error, so that location still counts as answered and this guard
+		// does not see it. Closing that hole means propagating a partial
+		// signal out of reconstruct.ListBaselines, which is upstream of here.
 		if merged.Listed < len(merged.Sources) || merged.Listed == 0 {
 			slog.Warn("console: coverage card could not list every backup location; the verdict is unknown rather than graded against a partial view",
 				"server", serverID(r), "listed", merged.Listed, "configured", len(merged.Sources))
 			resp.FullTableStatus = "unknown"
 			break
 		}
-		files := merged.Files
+		v := gradeFullTable(merged.Files, sum.Floor, now)
 		resp.FullTableStatus = "ok"
-		anchors := make(map[string]*tableAnchors, len(files))
-		for _, f := range files {
-			k := f.Schema + "." + f.Table
-			a := anchors[k]
-			if a == nil {
-				a = &tableAnchors{}
-				anchors[k] = a
-			}
-			a.observe(f.SnapshotTime, sum.Floor.Grade(f.SnapshotTime, now))
-		}
-		// Graded THROUGH the floor, never against its hour alone: on a
-		// multi-source index the hour is the live floor and an anchor below
-		// it is unattributable, not broken (#1219). Grading with the bare
-		// hour would name healthy tables in broken_tables — the false alarm
-		// the floor's own narrowing exists to avoid.
-		var from time.Time
-		var unevaluable bool
-		for k, a := range anchors {
-			if !a.earliestUsable.IsZero() {
-				// The window covering ALL usable tables starts at the LATEST
-				// of their individual starts — and a table's own start is its
-				// EARLIEST usable anchor, not its newest (see tableAnchors).
-				if a.earliestUsable.After(from) {
-					from = a.earliestUsable
-				}
-				continue
-			}
-			// No usable anchor at all: the newest one says which kind of
-			// nothing this is.
-			if sum.Floor.Grade(a.newest, now) == status.BaselineBroken {
-				resp.BrokenTables = append(resp.BrokenTables, k)
-				continue
-			}
-			// Neither broken nor usable: it must not join broken_tables AND
-			// must not define the window, or "ok" would assert restorability
-			// from an anchor whose coverage is unknown.
-			unevaluable = true
-		}
-		sort.Strings(resp.BrokenTables)
-		if unevaluable {
+		resp.BrokenTables, resp.OffsiteTables = v.broken, v.offsite
+		if v.unevaluable {
 			resp.FullTableStatus = "unknown"
 			break
 		}
-		if !from.IsZero() {
-			resp.FullTableFrom = from.Format(consoleTSFormat)
+		if !v.from.IsZero() {
+			resp.FullTableFrom = v.from.Format(consoleTSFormat)
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)

@@ -265,6 +265,11 @@ type Input struct {
 	// value leaves the note stating the fact alone. A note that names a
 	// problem and no way to act on it is where the reader stops.
 	NewerElsewhereHowTo string
+	// NewerElsewhereUnchecked names the other location when the look at it did
+	// NOT answer, so the header can say the question is open instead of
+	// rendering a file indistinguishable from one whose other location was
+	// read and held nothing newer. Set only when NewerElsewhere is zero.
+	NewerElsewhereUnchecked string
 	// Follow records how, if at all, the state views reach a snapshot published
 	// after this file was generated (#1484, #1550). ApplyFollow is what sets
 	// it; see FollowMode for what each mode costs the reader.
@@ -795,14 +800,14 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("--   (none registered in archive_state: no rotated partitions have been archived yet)\n")
 	}
 	for _, s := range in.ArchiveSources {
-		fmt.Fprintf(b, "--   %s\n", s)
+		fmt.Fprintf(b, "--   %s\n", commentSafe(s))
 	}
 	b.WriteString("-- Baseline snapshot:\n")
 	switch {
 	case len(in.Baselines) == 0 && in.BaselineSource == "":
 		b.WriteString("--   (no baseline source given: pass --baseline-dir or --baseline-s3)\n")
 	case len(in.Baselines) == 0:
-		fmt.Fprintf(b, "--   (none discoverable under %s)\n", in.BaselineSource)
+		fmt.Fprintf(b, "--   (none discoverable under %s)\n", commentSafe(in.BaselineSource))
 	case in.SnapshotScoped && in.BaselineSource == ".":
 		// The tarball's copy (#1583): paths spelled "./schema/table.parquet".
 		// Guarded by INTENT, not by the path value alone: `bintrail views
@@ -822,15 +827,27 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("--   holding the schema directories). From anywhere else the reads fail with\n")
 		b.WriteString("--   DuckDB's own \"No files found\" naming the exact relative path.\n")
 	default:
+		// commentSafe on the SOURCE as well as the sentence: a registry entry's
+		// baseline path is operator-supplied and unvalidated for newlines, and
+		// one here would end the comment and leave the rest of the path on a
+		// line DuckDB executes. The HowTo beside it is a compile-time
+		// constant; this one is not, which is the half that needed it.
 		fmt.Fprintf(b, "--   %s at %s (%d table(s))\n",
-			in.BaselineSource, in.BaselineSnapshot.UTC().Format(time.RFC3339), len(in.Baselines))
-		if !in.NewerElsewhere.IsZero() {
+			commentSafe(in.BaselineSource), in.BaselineSnapshot.UTC().Format(time.RFC3339), len(in.Baselines))
+		switch {
+		case !in.NewerElsewhere.IsZero():
 			fmt.Fprintf(b, "--   NOTE: a newer snapshot (%s) exists under %s, which this file does\n"+
 				"--   not read. A file names one location, and its paths only resolve there.\n",
-				in.NewerElsewhere.UTC().Format(time.RFC3339), in.NewerElsewhereSource)
+				in.NewerElsewhere.UTC().Format(time.RFC3339), commentSafe(in.NewerElsewhereSource))
 			if in.NewerElsewhereHowTo != "" {
 				fmt.Fprintf(b, "--   %s\n", commentSafe(in.NewerElsewhereHowTo))
 			}
+		case in.NewerElsewhereUnchecked != "":
+			// Say the check did not answer. Silence here is indistinguishable
+			// from "the other location holds nothing newer", and the two lead
+			// to opposite actions. Same shape as the archive half above.
+			fmt.Fprintf(b, "--   (whether %s holds a newer snapshot could not be read; the\n"+
+				"--   console log has the error)\n", commentSafe(in.NewerElsewhereUnchecked))
 		}
 		switch in.Follow {
 		case FollowPointer:

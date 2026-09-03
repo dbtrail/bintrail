@@ -3,6 +3,9 @@ package console
 import (
 	"testing"
 	"time"
+
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
+	"github.com/dbtrail/dbtrail/internal/status"
 )
 
 // Restore Coverage answers "how far back can this be restored", and it used to
@@ -84,5 +87,76 @@ func TestCoverageAPI_partialListingIsUnknownNotAShorterWindow(t *testing.T) {
 	// locations, so it stays a real answer.
 	if got.DeltaFrom == "" {
 		t.Error("the live floor is independent of the backup listing and must still be reported")
+	}
+}
+
+// The listing behind this card reads every backup location (#1571); the
+// Restore button beside it folds from the local directory alone (#1541). A
+// table whose only usable anchor is in the bucket must therefore NOT advance
+// full_table_from -- the card would print a start the button then refuses with
+// "no backup exists at or before <t>" -- and must NOT join broken_tables,
+// which drives an alarm a backup that exists off site does not deserve.
+//
+// Driven through gradeFullTable rather than the endpoint because an s3://
+// location cannot be listed from a unit test, so a handler-level test can only
+// ever produce local anchors: exactly the shape this split is not about.
+func TestGradeFullTable_anOffsiteAnchorDoesNotWidenTheRestoreWindow(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	floor := status.DeltaFloor{Hour: now.Add(-100 * time.Hour)}
+	below, above := now.Add(-150*time.Hour), now.Add(-2*time.Hour)
+	// OLDER than the S3-only anchor on purpose: the window is the LATEST of the
+	// per-table starts, so counting the offsite anchor would move `from`
+	// forward to it. With the local table newer, both readings coincide and
+	// the assertion below could not tell them apart.
+	localOrders := now.Add(-9 * time.Hour)
+
+	got := gradeFullTable([]reconstruct.BaselineFile{
+		// A healthy local table, which is what full_table_from may name.
+		{Schema: "shop", Table: "orders", SnapshotTime: localOrders, Path: "/backups/2026/shop/orders.parquet"},
+		// Local copy aged out below the floor; the usable one is in S3 only.
+		{Schema: "shop", Table: "carts", SnapshotTime: below, Path: "/backups/old/shop/carts.parquet"},
+		{Schema: "shop", Table: "carts", SnapshotTime: above, Path: "s3://bucket/prefix/2026/shop/carts.parquet"},
+	}, floor, now)
+
+	if got.from.Equal(above) {
+		t.Errorf("full_table_from advanced to %s, the S3-only anchor. The console's Restore "+
+			"folds from BaselineDir and never opens the bucket (#1541), so this start is one "+
+			"the button refuses -- a green panel over a restore that cannot run", above)
+	}
+	if !got.from.Equal(localOrders) {
+		t.Errorf("from = %s, want %s: the window is the latest LOCAL earliest-usable anchor", got.from, localOrders)
+	}
+	if len(got.broken) != 0 {
+		t.Errorf("broken = %v, want none: shop.carts has a current backup, it is just off site. "+
+			"broken_tables drives an alarm and says 'take a fresh backup', which is wrong advice here", got.broken)
+	}
+	if len(got.offsite) != 1 || got.offsite[0] != "shop.carts" {
+		t.Errorf("offsite = %v, want [shop.carts]: silence here is the failure -- the operator sees "+
+			"a clean card and never learns the table is unrestorable from this console", got.offsite)
+	}
+	if got.unevaluable {
+		t.Error("unevaluable: an offsite anchor is a known answer, not an unreadable one")
+	}
+}
+
+// The complement, so the classifier is not simply "s3 means offsite": a table
+// whose usable anchor IS local keeps defining the window even when a newer
+// copy also sits in the bucket. Without this, returning offsite for every
+// table with any S3 file would pass the test above.
+func TestGradeFullTable_aLocalAnchorStillCountsWhenS3AlsoHasIt(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	floor := status.DeltaFloor{Hour: now.Add(-100 * time.Hour)}
+	local := now.Add(-3 * time.Hour)
+
+	got := gradeFullTable([]reconstruct.BaselineFile{
+		{Schema: "shop", Table: "orders", SnapshotTime: local, Path: "/backups/2026/shop/orders.parquet"},
+		{Schema: "shop", Table: "orders", SnapshotTime: now.Add(-time.Hour), Path: "s3://bucket/p/2026/shop/orders.parquet"},
+	}, floor, now)
+
+	if !got.from.Equal(local) {
+		t.Errorf("from = %s, want %s: the earliest usable LOCAL anchor is what Restore can reach", got.from, local)
+	}
+	if len(got.offsite) != 0 {
+		t.Errorf("offsite = %v, want none: this table is restorable from the local directory", got.offsite)
 	}
 }

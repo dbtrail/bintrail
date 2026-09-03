@@ -98,3 +98,62 @@ func firstLines(s string, n int) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// With "Works on another machine" already ticked, the newer snapshot is the
+// LOCAL one -- and the route to it is to untick the box, which would hand a
+// file of local paths to a reader who asked for one that travels. So the note
+// states the fact and withholds the route.
+//
+// Guarded because the !req.PortableBaseline half survived mutation: nothing
+// drove portable_baseline together with a newer local snapshot, so dropping it
+// would tell a reader who has ALREADY ticked the box to tick it again, with CI
+// green.
+func TestViewsFile_withTheBoxTickedItStatesTheFactWithoutTheRoute(t *testing.T) {
+	local, bucketish := t.TempDir(), t.TempDir()
+	// Reversed against the test above: the newer snapshot is the local one, so
+	// the file being generated (the portable, s3-rooted one) is the older.
+	writeBaselineFixture(t, local, "2026-06-10T12-00-00Z", "shop", "orders.parquet")
+	writeBaselineFixture(t, bucketish, "2026-06-03T12-00-00Z", "shop", "orders.parquet")
+
+	srv := newBaselineServerWithFallback(t, local, bucketish)
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?portable_baseline=1", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, body)
+	}
+	sql := string(body)
+	if !strings.Contains(sql, "2026-06-10T12:00:00Z") {
+		t.Fatalf("the note does not name the newer snapshot at all:\n%s", firstLines(sql, 25))
+	}
+	if strings.Contains(sql, "Works on another machine") {
+		t.Errorf("the file tells a reader who ALREADY ticked the box to tick it. The route that "+
+			"would reach the newer snapshot here is to UNTICK it, and naming that route would "+
+			"undo the one thing this download was asked for:\n%s", firstLines(sql, 25))
+	}
+}
+
+// A second location that will not answer must SAY SO. Silence is
+// indistinguishable from "the other location holds nothing newer", and the two
+// lead to opposite actions: one operator stops looking, the other goes and
+// checks. The archive half of the same header already says
+// "(could not be read from archive_state; ...)" for exactly this reason.
+func TestViewsFile_saysWhenTheOtherLocationDidNotAnswer(t *testing.T) {
+	local := t.TempDir()
+	writeBaselineFixture(t, local, "2026-06-03T12-00-00Z", "shop", "orders.parquet")
+
+	srv := newBaselineServerWithFallback(t, local, "/definitely/not/a/directory/1571")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, body)
+	}
+	sql := string(body)
+	// Deliberately NOT the bare "could not be read": the archive half of the
+	// same header carries that phrase for its own failure, so the loose form
+	// passed while this line was absent entirely.
+	if !strings.Contains(sql, "holds a newer snapshot could not be read") {
+		t.Errorf("the file is indistinguishable from one whose other location was read and held "+
+			"nothing newer:\n%s", firstLines(sql, 25))
+	}
+	if !strings.Contains(sql, "/definitely/not/a/directory/1571") {
+		t.Errorf("the disclosure does not name WHICH location went unchecked:\n%s", firstLines(sql, 25))
+	}
+}

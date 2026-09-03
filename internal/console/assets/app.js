@@ -1164,6 +1164,12 @@ function covCard(c, stamp) {
     if (c.broken_tables && c.broken_tables.length) {
       card.append(el("p", { class: "cov-line bad", text: "Not fully restorable (newest backup predates coverage): " + c.broken_tables.join(", ") + ". Take a fresh backup." }));
     }
+    if (c.offsite_tables && c.offsite_tables.length) {
+      // Warn, not bad: the backup exists and Time travel reads it from the
+      // bucket. What cannot use it is Restore, which folds from the local
+      // backup folder only.
+      card.append(el("p", { class: "cov-line warn", text: "Backed up only in S3, so Restore here cannot fold them: " + c.offsite_tables.join(", ") + ". Time travel still reads them. Take a local backup to restore them from this console." }));
+    }
   }
   return card;
 }

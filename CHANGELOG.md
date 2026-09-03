@@ -14,10 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destination a table whose only surviving anchor lives in the bucket was not
   graded, not named broken, and not counted — a clean verdict over an inventory
   missing a table. It now merges both locations through the same
-  `listBaselinesMerged` the Backups listing uses (#1542), and **any** location
-  that fails to answer makes the verdict `unknown` rather than grading the half
-  that did: a partial listing can only understate coverage, and an understated
-  window names healthy tables broken.
+  `listBaselinesMerged` the Backups listing uses (#1542), and **a location that
+  fails to list** makes the verdict `unknown` rather than grading the half that
+  did: a partial listing can only understate coverage, and an understated
+  window names healthy tables broken. (A location that lists but skips an
+  unreadable snapshot directory returns no error, so it is not covered by that
+  rule.) Merging can also flip a verdict from `ok` to `unknown`, when the
+  second location contributes a table whose anchor is unattributable.
+  A table whose only usable backup is in S3 is reported in a new
+  `offsite_tables` bucket instead of widening the restorable window: the
+  listing reads every location, but the Restore button folds from the local
+  backup directory alone (#1541), so counting that anchor would print a start
+  the button then refuses. It is not `broken_tables` either — that drives an
+  alarm and advises a fresh backup, and the backup exists. Time travel still
+  reads it, through the S3 fallback `bundle.findBaseline` already has (#766).
 - **The downloaded `views.sql` says when a newer backup lives somewhere it does
   not read** (#1571). The file names ONE root and every state view resolves a
   path under it, so merging the two locations would produce views that half of
