@@ -146,6 +146,14 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, req viewsReques
 				case len(othersFiles) > 0 && othersFiles[0].SnapshotTime.After(newest):
 					in.NewerElsewhere = othersFiles[0].SnapshotTime
 					in.NewerElsewhereSource = other
+					// The route, not just the fact (#1551 gave the download a
+					// control for exactly this). Named only when the toggle
+					// would actually change which location is read — the
+					// reader has a checkbox, not a command line, and pointing
+					// at a flag they cannot pass is not remediation.
+					if b.baselineFallbackSrc != "" && !req.PortableBaseline {
+						in.NewerElsewhereHowTo = `To read that one instead, tick "Works on another machine" and download again.`
+					}
 				}
 			}
 			for _, f := range files {

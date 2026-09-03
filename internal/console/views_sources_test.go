@@ -33,6 +33,14 @@ func TestViewsFile_namesANewerSnapshotItDoesNotRead(t *testing.T) {
 			"other location. A reader cannot tell the state views are describing a week-old "+
 			"table:\n%s", firstLines(sql, 20))
 	}
+	// And the ROUTE, not just the fact. The reader of this file has a checkbox,
+	// not a command line, so a note that names a problem without naming the
+	// control that fixes it is where they stop (the same rule LiveLegHowTo
+	// keeps for the other half of this page).
+	if !strings.Contains(sql, `tick "Works on another machine"`) {
+		t.Errorf("the note says a newer snapshot exists elsewhere and not how to get it:\n%s", firstLines(sql, 25))
+	}
+
 	// The warning must not become a correction: the paths still have to
 	// resolve, so nothing from the other location may appear as a view source.
 	for _, line := range strings.Split(sql, "\n") {

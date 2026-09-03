@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Restore Coverage is graded across every backup location** (#1571). The
+  panel that answers how far back a server can be restored derived that from
+  `bundle.baselineSrc` alone, so on a server with a local directory and an S3
+  destination a table whose only surviving anchor lives in the bucket was not
+  graded, not named broken, and not counted — a clean verdict over an inventory
+  missing a table. It now merges both locations through the same
+  `listBaselinesMerged` the Backups listing uses (#1542), and **any** location
+  that fails to answer makes the verdict `unknown` rather than grading the half
+  that did: a partial listing can only understate coverage, and an understated
+  window names healthy tables broken.
+- **The downloaded `views.sql` says when a newer backup lives somewhere it does
+  not read** (#1571). The file names ONE root and every state view resolves a
+  path under it, so merging the two locations would produce views that half of
+  its readers cannot open — the paths would not resolve. What silence cost was
+  quieter: with the newest snapshot aged out of local retention but still in
+  the bucket, the file pinned the older local one and read as current. The
+  header now names the newer snapshot, where it is, and the control that reads
+  it instead ("Works on another machine"). Best-effort: a second location that
+  will not answer costs the note, never the download.
+
 ### Changed
 - **The `events` view binds one Parquet footer per SCHEMA, not per archived
   file** (#1535). `archive_state` gains `column_set`, the archived file's own

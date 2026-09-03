@@ -259,6 +259,12 @@ type Input struct {
 	// one had already aged out of local retention, reading as current.
 	NewerElsewhere       time.Time
 	NewerElsewhereSource string
+	// NewerElsewhereHowTo is the route THIS producer's reader can take to get
+	// that snapshot instead, rendered verbatim as one comment line. Same rule
+	// as LiveLegHowTo: this package states no route it cannot see, so an empty
+	// value leaves the note stating the fact alone. A note that names a
+	// problem and no way to act on it is where the reader stops.
+	NewerElsewhereHowTo string
 	// Follow records how, if at all, the state views reach a snapshot published
 	// after this file was generated (#1484, #1550). ApplyFollow is what sets
 	// it; see FollowMode for what each mode costs the reader.
@@ -822,6 +828,9 @@ func writeHeader(b *strings.Builder, in Input) {
 			fmt.Fprintf(b, "--   NOTE: a newer snapshot (%s) exists under %s, which this file does\n"+
 				"--   not read. A file names one location, and its paths only resolve there.\n",
 				in.NewerElsewhere.UTC().Format(time.RFC3339), in.NewerElsewhereSource)
+			if in.NewerElsewhereHowTo != "" {
+				fmt.Fprintf(b, "--   %s\n", commentSafe(in.NewerElsewhereHowTo))
+			}
 		}
 		switch in.Follow {
 		case FollowPointer:
