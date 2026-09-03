@@ -1,6 +1,7 @@
 package console
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -103,7 +104,6 @@ func TestCoverageAPI_partialListingIsUnknownNotAShorterWindow(t *testing.T) {
 func TestGradeFullTable_anOffsiteAnchorDoesNotWidenTheRestoreWindow(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	floor := status.DeltaFloor{Hour: now.Add(-100 * time.Hour)}
-	below, above := now.Add(-150*time.Hour), now.Add(-2*time.Hour)
 	// OLDER than the S3-only anchor on purpose: the window is the LATEST of the
 	// per-table starts, so counting the offsite anchor would move `from`
 	// forward to it. With the local table newer, both readings coincide and
@@ -113,15 +113,25 @@ func TestGradeFullTable_anOffsiteAnchorDoesNotWidenTheRestoreWindow(t *testing.T
 	got := gradeFullTable([]reconstruct.BaselineFile{
 		// A healthy local table, which is what full_table_from may name.
 		{Schema: "shop", Table: "orders", SnapshotTime: localOrders, Path: "/backups/2026/shop/orders.parquet"},
-		// Local copy aged out below the floor; the usable one is in S3 only.
-		{Schema: "shop", Table: "carts", SnapshotTime: below, Path: "/backups/old/shop/carts.parquet"},
-		{Schema: "shop", Table: "carts", SnapshotTime: above, Path: "s3://bucket/prefix/2026/shop/carts.parquet"},
+		// The SAME table, also in the bucket and OLDER than its local copy --
+		// the #616 local-retention shape, and the common configuration. It is
+		// what makes `from` discriminate: reading earliestUsable instead of
+		// earliestUsableLocal would start the window here, at an instant with
+		// no local snapshot at or before it, which is exactly the refusal
+		// quoted below.
+		{Schema: "shop", Table: "orders", SnapshotTime: now.Add(-40 * time.Hour), Path: "s3://bucket/prefix/2026/shop/orders.parquet"},
+		// NO local copy at all, so findBaseline gets ErrNoBaseline from the
+		// local root and the #766 fallback really does serve this from S3.
+		{Schema: "shop", Table: "carts", SnapshotTime: now.Add(-2 * time.Hour), Path: "s3://bucket/prefix/2026/shop/carts.parquet"},
+		// A second offsite-only table, so the sort order of offsite_tables is
+		// asserted rather than hidden behind a single element.
+		{Schema: "shop", Table: "audit", SnapshotTime: now.Add(-3 * time.Hour), Path: "s3://bucket/prefix/2026/shop/audit.parquet"},
 	}, floor, now)
 
-	if got.from.Equal(above) {
-		t.Errorf("full_table_from advanced to %s, the S3-only anchor. The console's Restore "+
-			"folds from BaselineDir and never opens the bucket (#1541), so this start is one "+
-			"the button refuses -- a green panel over a restore that cannot run", above)
+	if got.from.Equal(now.Add(-2 * time.Hour)) {
+		t.Errorf("full_table_from advanced to the S3-only anchor. The console's Restore folds " +
+			"from BaselineDir and never opens the bucket (#1541), so this start is one the " +
+			"button refuses -- a green panel over a restore that cannot run")
 	}
 	if !got.from.Equal(localOrders) {
 		t.Errorf("from = %s, want %s: the window is the latest LOCAL earliest-usable anchor", got.from, localOrders)
@@ -130,12 +140,45 @@ func TestGradeFullTable_anOffsiteAnchorDoesNotWidenTheRestoreWindow(t *testing.T
 		t.Errorf("broken = %v, want none: shop.carts has a current backup, it is just off site. "+
 			"broken_tables drives an alarm and says 'take a fresh backup', which is wrong advice here", got.broken)
 	}
-	if len(got.offsite) != 1 || got.offsite[0] != "shop.carts" {
-		t.Errorf("offsite = %v, want [shop.carts]: silence here is the failure -- the operator sees "+
-			"a clean card and never learns the table is unrestorable from this console", got.offsite)
+	if !slices.Equal(got.offsite, []string{"shop.audit", "shop.carts"}) {
+		t.Errorf("offsite = %v, want [shop.audit shop.carts] in that order: silence here is the "+
+			"failure -- the operator sees a clean card and never learns the tables are "+
+			"unrestorable from this console -- and an unsorted list reorders between requests", got.offsite)
 	}
 	if got.unevaluable {
 		t.Error("unevaluable: an offsite anchor is a known answer, not an unreadable one")
+	}
+}
+
+// A STALE LOCAL COPY SHADOWS THE FRESH OFFSITE ONE, and that is broken, not
+// offsite. bundle.findBaseline falls back to the bucket only on ErrNoBaseline
+// (#766); a table with any local snapshot at-or-before the instant gets a nil
+// error, so the fallback never fires and time travel resolves the stale copy.
+// No console surface reaches the fresh S3 sibling.
+//
+// Calling this offsite would trade the red "take a fresh backup" this card
+// gave before #1571 for a warning that PROMISES a working time travel -- the
+// operator would read the promise and not take the backup.
+func TestGradeFullTable_aStaleLocalCopyShadowsTheOffsiteOneAndStaysBroken(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	floor := status.DeltaFloor{Hour: now.Add(-100 * time.Hour)}
+
+	got := gradeFullTable([]reconstruct.BaselineFile{
+		{Schema: "shop", Table: "orders", SnapshotTime: now.Add(-time.Hour), Path: "/backups/new/shop/orders.parquet"},
+		// Below the floor, and it is what findBaseline will resolve.
+		{Schema: "shop", Table: "carts", SnapshotTime: now.Add(-150 * time.Hour), Path: "/backups/old/shop/carts.parquet"},
+		// Fresh, in the bucket, and unreachable because of the line above.
+		{Schema: "shop", Table: "carts", SnapshotTime: now.Add(-2 * time.Hour), Path: "s3://bucket/prefix/2026/shop/carts.parquet"},
+	}, floor, now)
+
+	if len(got.offsite) != 0 {
+		t.Errorf("offsite = %v, want none: the stale LOCAL copy is what findBaseline resolves, so "+
+			"the fresh S3 one is unreachable from every console surface and the card would be "+
+			"promising a time travel that silently serves the stale data", got.offsite)
+	}
+	if len(got.broken) != 1 || got.broken[0] != "shop.carts" {
+		t.Errorf("broken = %v, want [shop.carts]: this is the verdict the card gave before it read "+
+			"both locations, and reading the second one must not silence it", got.broken)
 	}
 }
 
@@ -158,5 +201,32 @@ func TestGradeFullTable_aLocalAnchorStillCountsWhenS3AlsoHasIt(t *testing.T) {
 	}
 	if len(got.offsite) != 0 {
 		t.Errorf("offsite = %v, want none: this table is restorable from the local directory", got.offsite)
+	}
+}
+
+// An S3-only server has no local anchor by construction, so every table would
+// be enumerated as offsite and the card would lose the number it exists to
+// print. That is a configuration fact, stated once. A warn line naming the
+// whole schema is the kind of line operators learn to skip.
+func TestCoverageAPI_anS3OnlyServerStatesItOnceInsteadOfNamingEveryTable(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	latest := now.Add(-30 * time.Second)
+	part := now.Add(-100 * time.Hour).Format("p_2006010215")
+
+	// Only an s3:// source configured. It cannot be listed here, which is the
+	// point: the branch must be decided from the CONFIGURATION, before any
+	// listing, or an unreachable bucket and an S3-only server look the same.
+	srv := newBaselineServerWithFallback(t, "s3://bucket/prefix", "")
+	srv.cm.boot.db = coverageMockDB(t, part, latest, nil)
+	srv.cm.boot.dbName = "binlog_index"
+	got := coverageGet(t, srv)
+
+	if len(got.OffsiteTables) != 0 {
+		t.Errorf("offsite_tables = %v, want none: with no local directory at all, every table is "+
+			"offsite and the enumeration says nothing a single sentence does not", got.OffsiteTables)
+	}
+	if !got.RestoreNeedsLocal {
+		t.Error("restore_needs_local is false: the operator gets no explanation for a card with " +
+			"no restore window, on a server where Restore refuses outright for want of a local folder")
 	}
 }

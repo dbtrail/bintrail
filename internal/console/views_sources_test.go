@@ -157,3 +157,25 @@ func TestViewsFile_saysWhenTheOtherLocationDidNotAnswer(t *testing.T) {
 		t.Errorf("the disclosure does not name WHICH location went unchecked:\n%s", firstLines(sql, 25))
 	}
 }
+
+// Both locations holding the SAME snapshot is the steady state on a server
+// whose local backups are uploaded, so the boundary matters: the note must
+// fire only on a STRICTLY newer snapshot. Relaxing the comparison to
+// "not older" would print a note pointing at the snapshot the file already
+// reads, which is worse than silence -- it sends the operator to fetch a copy
+// of what they have.
+func TestViewsFile_saysNothingWhenBothLocationsHoldTheSameSnapshot(t *testing.T) {
+	local, bucketish := t.TempDir(), t.TempDir()
+	writeBaselineFixture(t, local, "2026-06-03T12-00-00Z", "shop", "orders.parquet")
+	writeBaselineFixture(t, bucketish, "2026-06-03T12-00-00Z", "shop", "orders.parquet")
+
+	srv := newBaselineServerWithFallback(t, local, bucketish)
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, body)
+	}
+	if sql := string(body); strings.Contains(sql, "a newer snapshot") {
+		t.Errorf("the file claims a newer snapshot exists elsewhere when both locations hold the "+
+			"same one:\n%s", firstLines(sql, 25))
+	}
+}

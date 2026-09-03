@@ -856,7 +856,7 @@ func writeHeader(b *strings.Builder, in Input) {
 			// actually open. Reporting only one of the two would make a
 			// followed file indistinguishable from a pinned one.
 			fmt.Fprintf(b, "--   read through %s/%s, which is that snapshot right now\n",
-				strings.TrimSuffix(in.BaselineSource, "/"), baseline.CurrentLinkName)
+				commentSafe(strings.TrimSuffix(in.BaselineSource, "/")), baseline.CurrentLinkName)
 		case FollowNewest:
 			// Same job as the pointer line, and the same reason: the timestamp
 			// above is where the column types came from, not what the views

@@ -3,6 +3,7 @@ package console
 import (
 	"log/slog"
 	"net/http"
+	"slices"
 	"sort"
 	"time"
 
@@ -78,6 +79,11 @@ type coverageResponse struct {
 	// (#1571), but the restore path does not (#1541), so folding these into
 	// full_table_from would promise a restore the button cannot perform.
 	OffsiteTables []string `json:"offsite_tables,omitempty"`
+	// RestoreNeedsLocal marks a server whose backups go ONLY to S3: the Restore
+	// button needs a local backup directory to fold from and refuses outright
+	// without one, so no per-table finding applies and offsite_tables is left
+	// empty rather than naming the entire schema.
+	RestoreNeedsLocal bool `json:"restore_needs_local,omitempty"`
 }
 
 // tableAnchors holds the two baseline anchors of one table, which answer two
@@ -106,6 +112,16 @@ type tableAnchors struct {
 	newest              time.Time
 	earliestUsable      time.Time
 	earliestUsableLocal time.Time
+	// hasLocal and newestLocal describe the LOCAL copies alone, and they decide
+	// whether an offsite anchor is reachable by anything at all.
+	//
+	// bundle.findBaseline falls back to the bucket only on ErrNoBaseline (#766).
+	// A table with ANY local snapshot at-or-before the requested instant gets a
+	// nil error from the local root, so the fallback never fires and time travel
+	// resolves the STALE local copy. Its fresh S3 sibling is unreachable from
+	// every console surface, which is the pre-#1571 verdict: broken.
+	hasLocal    bool
+	newestLocal time.Time
 }
 
 // observe folds one baseline file's anchor in, with the verdict already graded
@@ -114,6 +130,12 @@ type tableAnchors struct {
 func (a *tableAnchors) observe(ts time.Time, v status.BaselineStalenessVerdict, local bool) {
 	if ts.After(a.newest) {
 		a.newest = ts
+	}
+	if local {
+		a.hasLocal = true
+		if ts.After(a.newestLocal) {
+			a.newestLocal = ts
+		}
 	}
 	switch v {
 	case status.BaselineOK, status.BaselineAging:
@@ -172,12 +194,29 @@ func gradeFullTable(files []reconstruct.BaselineFile, floor status.DeltaFloor, n
 			}
 			continue
 		}
+		if a.hasLocal {
+			// A stale local copy SHADOWS the fresh offsite one: findBaseline
+			// gets a nil error from the local root, so the #766 fallback never
+			// fires and no console surface reaches the bucket. Graded on the
+			// newest LOCAL anchor, which is exactly the verdict this card gave
+			// before it read both locations. Calling it offsite would trade a
+			// red "take a fresh backup" for a warning that promises a time
+			// travel that resolves the stale copy instead.
+			if floor.Grade(a.newestLocal, now) == status.BaselineBroken {
+				v.broken = append(v.broken, k)
+				continue
+			}
+			v.unevaluable = true
+			continue
+		}
 		if !a.earliestUsable.IsZero() {
-			// Usable, but only from the bucket. Named, not folded into the
-			// window and not called broken: the fold behind the Restore button
-			// reads the local directory only (#1541), so counting this anchor
-			// would print a start the button then refuses, while broken drives
-			// an alarm a backup that exists off site does not deserve.
+			// No local copy at all, so the local root answers ErrNoBaseline and
+			// the fallback DOES fire: time travel really reads this from the
+			// bucket. Named, not folded into the window and not called broken.
+			// The fold behind the Restore button reads the local directory only
+			// (#1541), so counting this anchor would print a start the button
+			// then refuses, while broken drives an alarm a backup that exists
+			// off site does not deserve.
 			v.offsite = append(v.offsite, k)
 			continue
 		}
@@ -257,6 +296,17 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 		// and an S3 destination, a snapshot that survives only in the bucket
 		// would be graded as if it were gone, and the panel would report a
 		// shorter restorable window than the one that exists.
+		// Decided from the CONFIGURATION, ahead of any listing: on a server that
+		// backs up ONLY to S3 there is no local anchor to find, so every table
+		// would be offsite and the card would print one warn line naming the
+		// whole schema. That is a configuration fact, stated once. A list of
+		// every table is the kind of line operators learn to skip, and the next
+		// one they skip is a real one. Ahead of the listing because an
+		// unreachable bucket and an S3-only server must not look the same.
+		restoreNeedsLocal := !slices.ContainsFunc(baselineSourcesOf(b),
+			func(s string) bool { return baselineKindOf(s) == "dir" })
+		resp.RestoreNeedsLocal = restoreNeedsLocal
+
 		merged := listBaselinesMerged(r.Context(), baselineSourcesOf(b), reconstruct.ListBaselines)
 		// ANY location that FAILED TO LIST makes the verdict unknown, not just
 		// all of them. A partial listing can only understate coverage, and an
@@ -278,6 +328,9 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 		v := gradeFullTable(merged.Files, sum.Floor, now)
 		resp.FullTableStatus = "ok"
 		resp.BrokenTables, resp.OffsiteTables = v.broken, v.offsite
+		if restoreNeedsLocal {
+			resp.OffsiteTables = nil
+		}
 		if v.unevaluable {
 			resp.FullTableStatus = "unknown"
 			break

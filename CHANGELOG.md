@@ -27,7 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backup directory alone (#1541), so counting that anchor would print a start
   the button then refuses. It is not `broken_tables` either — that drives an
   alarm and advises a fresh backup, and the backup exists. Time travel still
-  reads it, through the S3 fallback `bundle.findBaseline` already has (#766).
+  reads it, through the S3 fallback `bundle.findBaseline` already has (#766) —
+  which is also why a table whose STALE LOCAL copy shadows a fresh offsite one
+  stays in `broken_tables`: that fallback fires only on `ErrNoBaseline`, so a
+  local hit means no console surface ever reaches the bucket. On a server that
+  backs up only to S3 there is no local anchor at all, so the card states that
+  once (`restore_needs_local`) instead of naming every table.
 - **The downloaded `views.sql` says when a newer backup lives somewhere it does
   not read** (#1571). The file names ONE root and every state view resolves a
   path under it, so merging the two locations would produce views that half of
@@ -35,8 +40,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quieter: with the newest snapshot aged out of local retention but still in
   the bucket, the file pinned the older local one and read as current. The
   header now names the newer snapshot, where it is, and the control that reads
-  it instead ("Works on another machine"). Best-effort: a second location that
-  will not answer costs the note, never the download.
+  it instead ("Works on another machine"). The route is named only when the
+  control moves the reader *toward* the newer snapshot: with the box already
+  ticked the newer snapshot is the local one, and unticking would hand a file
+  of local paths to someone who asked for one that travels, so the fact is
+  stated and the route withheld. A second location that will not answer costs
+  the download nothing and is disclosed in the header, since silence there is
+  indistinguishable from "it holds nothing newer" and the two lead to opposite
+  actions. Every operator-supplied path printed into the header is now escaped
+  for newlines: a registry backup path containing one ended the comment and
+  left the rest of the value on a line DuckDB would execute.
 
 ### Changed
 - **The `events` view binds one Parquet footer per SCHEMA, not per archived

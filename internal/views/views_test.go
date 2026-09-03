@@ -233,15 +233,28 @@ func TestGenerate_aNewlineInAPathCannotEscapeTheHeaderComment(t *testing.T) {
 		Baselines:            []BaselineTable{{Schema: "shop", Table: "orders", Path: "/backups/shop/orders.parquet"}},
 		NewerElsewhere:       time.Date(2026, 5, 1, 9, 0, 0, 0, time.UTC),
 		NewerElsewhereSource: "s3://bucket/prefix" + poison,
+		// FollowPointer prints the root a SECOND time, in its own arm two lines
+		// below. Left at the zero value this test is blind to that print, which
+		// is how it survived the first pass.
+		Follow: FollowPointer,
 	}
+	// The unchecked-location arm is the SIBLING of NewerElsewhere in the same
+	// switch, so it never renders in the case above and needs its own input.
+	unchecked := in
+	unchecked.NewerElsewhere = time.Time{}
+	unchecked.NewerElsewhereSource = ""
+	unchecked.NewerElsewhereUnchecked = "s3://bucket/prefix" + poison
+
 	// The header is the leading run of comment lines, closed by a blank line.
-	for _, line := range strings.Split(Generate(in), "\n") {
-		if strings.TrimSpace(line) == "" {
-			break
-		}
-		if !strings.HasPrefix(strings.TrimSpace(line), "--") {
-			t.Errorf("a newline in an operator-supplied path broke out of the header comment, "+
-				"leaving this line for DuckDB to execute: %q", line)
+	for name, probe := range map[string]Input{"newer-elsewhere": in, "unchecked": unchecked} {
+		for _, line := range strings.Split(Generate(probe), "\n") {
+			if strings.TrimSpace(line) == "" {
+				break
+			}
+			if !strings.HasPrefix(strings.TrimSpace(line), "--") {
+				t.Errorf("[%s] a newline in an operator-supplied path broke out of the header "+
+					"comment, leaving this line for DuckDB to execute: %q", name, line)
+			}
 		}
 	}
 }
