@@ -158,6 +158,7 @@ func Build(parent context.Context, sourceDSN, indexDSN, schemasCSV string, index
 	report.add(checkServerIDCollision(ctx, sourceDB, sourceDSN))
 	report.add(checkFKCascades(sourceDB, schemas))
 	report.add(checkSchemaVisibility(ctx, sourceDB, schemas))
+	report.add(checkPrimaryKeys(ctx, sourceDB, schemas))
 
 	// ── Index MySQL checks (optional) ─────────────────────────────────────────
 	if indexDSN != "" {
@@ -815,6 +816,122 @@ func checkFKCascades(db *sql.DB, schemas []string) CheckResult {
 			"schemas — it WARNS and proceeds — so the FK graph is captured for cascade recovery.\n" +
 			"Plain `recover` still produces incomplete SQL for cascade-affected tables; use\n" +
 			"`recover-cascade` instead for those.",
+	}
+}
+
+// pkNameLimit caps how many table names a missing-primary-key warning prints
+// before it falls back to counting. A schema converted from MyISAM can have
+// hundreds, and a wall of names is read as noise where a count plus a query
+// is read as a task.
+const pkNameLimit = 10
+
+// checkPrimaryKeys warns about tables with no PRIMARY KEY.
+//
+// A WARN and never a FAIL, deliberately. Capture of those tables still works
+// and is still worth having: the events are indexed, they are queryable, and
+// refusing to start would trade a partial capability for none. What the
+// operator loses is everything keyed by the row's identity, and losing it
+// SILENTLY is the reason this check exists at all — nothing else in the
+// pipeline says a word. The row images carry an empty pk_values, and from
+// there `recover` cannot address the row, `reconstruct` refuses the table
+// outright (supportedPKType), and `verify --check recover` cannot walk the
+// chain and grades it unwalkable (#318). Captured and unrecoverable is the
+// worst state for a backup product, because it looks like it is working.
+func checkPrimaryKeys(ctx context.Context, db *sql.DB, schemas []string) CheckResult {
+	const name = "Every table has a PRIMARY KEY"
+	// LEFT JOIN over TABLE_CONSTRAINTS rather than COLUMN_KEY = 'PRI': the
+	// column view reports the first column of any unique-ish key on some
+	// versions, and the constraint is the thing being asserted.
+	query := `SELECT t.TABLE_SCHEMA, t.TABLE_NAME
+		FROM information_schema.TABLES t
+		LEFT JOIN information_schema.TABLE_CONSTRAINTS c
+		  ON  c.TABLE_SCHEMA = t.TABLE_SCHEMA
+		  AND c.TABLE_NAME = t.TABLE_NAME
+		  AND c.CONSTRAINT_TYPE = 'PRIMARY KEY'
+		WHERE t.TABLE_TYPE = 'BASE TABLE'
+		  AND c.CONSTRAINT_NAME IS NULL`
+	var args []any
+	if len(schemas) > 0 {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
+		query += fmt.Sprintf(" AND t.TABLE_SCHEMA IN (%s)", placeholders)
+		for _, sc := range schemas {
+			args = append(args, sc)
+		}
+	} else {
+		query += " AND t.TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')"
+	}
+	query += " ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME"
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return CheckResult{
+			Name:        name,
+			Status:      StatusFail,
+			Detail:      err.Error(),
+			Remediation: queryErrorRemediation("information_schema.TABLE_CONSTRAINTS"),
+		}
+	}
+	defer rows.Close()
+
+	var names []string
+	total := 0
+	for rows.Next() {
+		var schema, table string
+		if err := rows.Scan(&schema, &table); err != nil {
+			return CheckResult{
+				Name:        name,
+				Status:      StatusFail,
+				Detail:      err.Error(),
+				Remediation: queryErrorRemediation("information_schema.TABLE_CONSTRAINTS"),
+			}
+		}
+		total++
+		if len(names) < pkNameLimit {
+			names = append(names, schema+"."+table)
+		}
+	}
+	// Checked, not ignored: a driver error mid-iteration would otherwise
+	// report the tables seen so far as if that were the whole answer, and
+	// "no tables without a primary key" is the reassuring half.
+	if err := rows.Err(); err != nil {
+		return CheckResult{
+			Name:        name,
+			Status:      StatusFail,
+			Detail:      err.Error(),
+			Remediation: queryErrorRemediation("information_schema.TABLE_CONSTRAINTS"),
+		}
+	}
+	if total == 0 {
+		return CheckResult{Name: name, Status: StatusPass}
+	}
+
+	detail := fmt.Sprintf("%d table(s) without a primary key: %s", total, strings.Join(names, ", "))
+	if total > len(names) {
+		detail += fmt.Sprintf(", and %d more", total-len(names))
+	}
+	return CheckResult{
+		Name:   name,
+		Status: StatusWarn,
+		Detail: detail,
+		Remediation: "Changes to these tables are captured, but they cannot be addressed by row:\n" +
+			"bintrail identifies a row by its primary key, and without one the stored image\n" +
+			"carries no key at all. For these tables that means:\n\n" +
+			"  - `bintrail recover` cannot generate SQL that targets the affected row\n" +
+			"  - `bintrail reconstruct` refuses the table\n" +
+			"  - `bintrail verify --check recover` reports them as unwalkable, not as verified\n\n" +
+			"Capture is not blocked and the events are still queryable, so this is a warning\n" +
+			"rather than a refusal. To close the gap, give each table a primary key:\n\n" +
+			"  ALTER TABLE <schema>.<table> ADD PRIMARY KEY (<existing unique column>);\n\n" +
+			"When no column is unique, an added surrogate key works and is what InnoDB is\n" +
+			"already keeping internally, invisibly:\n\n" +
+			"  ALTER TABLE <schema>.<table> ADD COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST;\n\n" +
+			"Rows captured BEFORE the key is added keep their empty key, so the gap closes\n" +
+			"for new changes only. List them all with:\n\n" +
+			"  SELECT t.TABLE_SCHEMA, t.TABLE_NAME FROM information_schema.TABLES t\n" +
+			"    LEFT JOIN information_schema.TABLE_CONSTRAINTS c\n" +
+			"      ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME\n" +
+			"     AND c.CONSTRAINT_TYPE = 'PRIMARY KEY'\n" +
+			"    WHERE t.TABLE_TYPE = 'BASE TABLE' AND c.CONSTRAINT_NAME IS NULL;",
 	}
 }
 

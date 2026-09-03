@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`doctor` warns about tables with no primary key** (#1608). Capture of those
+  tables works and nothing in the pipeline says a word, which is the problem:
+  their row images carry an empty `pk_values`, so `recover` cannot address the
+  row, `reconstruct` refuses the table (`supportedPKType`), and
+  `verify --check recover` grades them unwalkable rather than verified (#318).
+  Captured and unrecoverable is the worst state for a backup product, because
+  it looks like it is working. A WARN and never a FAIL: capture of those tables
+  is still worth having, and refusing to start would trade a partial capability
+  for none. The check names the tables, up to ten, keeps the count exact past
+  that, and its remediation carries both the `ALTER TABLE` forms and the query
+  that lists the rest.
+
 ## [0.77.0] - 2026-09-03
 
 ### Fixed
