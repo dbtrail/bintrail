@@ -145,8 +145,8 @@ func TestGradeFullTable_anOffsiteAnchorDoesNotWidenTheRestoreWindow(t *testing.T
 			"failure -- the operator sees a clean card and never learns the tables are "+
 			"unrestorable from this console -- and an unsorted list reorders between requests", got.offsite)
 	}
-	if got.unevaluable {
-		t.Error("unevaluable: an offsite anchor is a known answer, not an unreadable one")
+	if len(got.unevaluable) != 0 {
+		t.Errorf("unevaluable = %v: an offsite anchor is a known answer, not an unreadable one", got.unevaluable)
 	}
 }
 
@@ -228,5 +228,44 @@ func TestCoverageAPI_anS3OnlyServerStatesItOnceInsteadOfNamingEveryTable(t *test
 	if !got.RestoreNeedsLocal {
 		t.Error("restore_needs_local is false: the operator gets no explanation for a card with " +
 			"no restore window, on a server where Restore refuses outright for want of a local folder")
+	}
+}
+
+// The ambiguity demotion (#1219) turns "broken" into "unknown" on an index
+// whose archives cannot be attributed to one source. In the shadowed branch
+// every local anchor is below the floor by construction, so that demotion is
+// not an edge case there: it is the ROUTINE verdict, and a bare unevaluable
+// flag dropped the table name on every one of those indexes.
+//
+// The whole console package had ZERO coverage of BelowIsUnknown, which is how
+// two review passes read this branch without seeing it.
+func TestGradeFullTable_anUnattributableFloorStillNamesTheTable(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	files := []reconstruct.BaselineFile{
+		{Schema: "shop", Table: "orders", SnapshotTime: now.Add(-time.Hour), Path: "/backups/new/shop/orders.parquet"},
+		{Schema: "shop", Table: "carts", SnapshotTime: now.Add(-150 * time.Hour), Path: "/backups/old/shop/carts.parquet"},
+		{Schema: "shop", Table: "carts", SnapshotTime: now.Add(-2 * time.Hour), Path: "s3://bucket/prefix/2026/shop/carts.parquet"},
+	}
+
+	// Attributable floor: the same fixture is a plain broken verdict.
+	attributable := gradeFullTable(files, status.DeltaFloor{Hour: now.Add(-100 * time.Hour)}, now)
+	if !slices.Equal(attributable.broken, []string{"shop.carts"}) {
+		t.Fatalf("broken = %v, want [shop.carts] on an attributable floor", attributable.broken)
+	}
+
+	// Unattributable: below the floor may still be covered by that source's own
+	// archives, so the verdict softens. The NAME must not soften with it.
+	got := gradeFullTable(files, status.DeltaFloor{Hour: now.Add(-100 * time.Hour), BelowIsUnknown: true}, now)
+	if len(got.broken) != 0 {
+		t.Errorf("broken = %v, want none: an unattributable floor must not accuse (#1219)", got.broken)
+	}
+	if !slices.Equal(got.unevaluable, []string{"shop.carts"}) {
+		t.Errorf("unevaluable = %v, want [shop.carts]. The card says 'could not be checked' and the "+
+			"operator gets no table name, on the verdict that is ROUTINE for a multi-source index -- "+
+			"the shadowing this branch exists to catch would be invisible there", got.unevaluable)
+	}
+	if len(got.offsite) != 0 {
+		t.Errorf("offsite = %v, want none: the stale local copy still shadows the bucket, whatever "+
+			"the floor can attribute", got.offsite)
 	}
 }

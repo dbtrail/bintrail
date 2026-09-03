@@ -84,6 +84,17 @@ type coverageResponse struct {
 	// without one, so no per-table finding applies and offsite_tables is left
 	// empty rather than naming the entire schema.
 	RestoreNeedsLocal bool `json:"restore_needs_local,omitempty"`
+	// UnevaluableTables: tables whose coverage could not be decided. They are
+	// why full_table_status is "unknown", and naming them is the whole point.
+	//
+	// The routine producer is the ambiguity demotion (#1219): on an index whose
+	// archives cannot be attributed to a source, DeltaFloor.Grade turns
+	// "broken" into "unknown", because a snapshot below the LIVE floor may
+	// still be covered by that source's own archives. That is the right call
+	// for the verdict and the wrong one for the inventory -- without the names
+	// the card says only "could not be checked", and the operator cannot tell
+	// which table to look at, or that any table is involved at all.
+	UnevaluableTables []string `json:"unevaluable_tables,omitempty"`
 }
 
 // tableAnchors holds the two baseline anchors of one table, which answer two
@@ -151,10 +162,12 @@ func (a *tableAnchors) observe(ts time.Time, v status.BaselineStalenessVerdict, 
 // fullTableVerdict is the full-table half of the coverage card, decided from a
 // baseline listing and the delta floor.
 type fullTableVerdict struct {
-	from        time.Time
-	broken      []string
-	offsite     []string
-	unevaluable bool
+	from    time.Time
+	broken  []string
+	offsite []string
+	// unevaluable lists the tables that could not be graded, and is what makes
+	// the whole card "unknown". A bare bool erased the names.
+	unevaluable []string
 }
 
 // gradeFullTable folds a merged baseline listing into that verdict.
@@ -206,7 +219,13 @@ func gradeFullTable(files []reconstruct.BaselineFile, floor status.DeltaFloor, n
 				v.broken = append(v.broken, k)
 				continue
 			}
-			v.unevaluable = true
+			// Only the ambiguity demotion reaches here: every local anchor is
+			// below the floor (branch 1 took the usable ones), so the grade is
+			// Broken unless BelowIsUnknown turned it into Unknown. Named rather
+			// than dropped -- this is the shape the shadowing check exists to
+			// catch, and on a multi-source index it is the ROUTINE verdict, so
+			// silently unevaluable would erase it most of the time.
+			v.unevaluable = append(v.unevaluable, k)
 			continue
 		}
 		if !a.earliestUsable.IsZero() {
@@ -229,10 +248,11 @@ func gradeFullTable(files []reconstruct.BaselineFile, floor status.DeltaFloor, n
 		// Neither broken nor usable: it must not join broken AND must not
 		// define the window, or "ok" would assert restorability from an anchor
 		// whose coverage is unknown.
-		v.unevaluable = true
+		v.unevaluable = append(v.unevaluable, k)
 	}
 	sort.Strings(v.broken)
 	sort.Strings(v.offsite)
+	sort.Strings(v.unevaluable)
 	return v
 }
 
@@ -331,8 +351,14 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 		if restoreNeedsLocal {
 			resp.OffsiteTables = nil
 		}
-		if v.unevaluable {
+		if len(v.unevaluable) > 0 {
 			resp.FullTableStatus = "unknown"
+			resp.UnevaluableTables = v.unevaluable
+			// The card tells the operator to check the daemon log, and this is
+			// the only producer of "unknown" that was not writing one: the
+			// listing failure and the missing floor both log already.
+			slog.Warn("console: coverage could not grade every table; their newest backup sits below a floor whose archives cannot be attributed to one source",
+				"server", serverID(r), "tables", v.unevaluable)
 			break
 		}
 		if !v.from.IsZero() {

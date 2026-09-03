@@ -32,7 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays in `broken_tables`: that fallback fires only on `ErrNoBaseline`, so a
   local hit means no console surface ever reaches the bucket. On a server that
   backs up only to S3 there is no local anchor at all, so the card states that
-  once (`restore_needs_local`) instead of naming every table.
+  once (`restore_needs_local`) instead of naming every table. Tables that
+  could not be graded at all are named in `unevaluable_tables` rather than
+  collapsing into a bare "could not be checked": on an index whose archives
+  cannot be attributed to one source, the ambiguity demotion (#1219) turns
+  every shadowed table's verdict into `unknown`, which is the right call for
+  the verdict and would have erased the inventory it applies to.
 - **The downloaded `views.sql` says when a newer backup lives somewhere it does
   not read** (#1571). The file names ONE root and every state view resolves a
   path under it, so merging the two locations would produce views that half of
