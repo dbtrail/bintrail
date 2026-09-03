@@ -1172,7 +1172,7 @@ function covCard(c, stamp) {
       card.append(el("p", { class: "cov-line bad", text: "Not fully restorable (newest backup predates coverage): " + c.broken_tables.join(", ") + ". Take a fresh backup." }));
     }
     if (c.restore_needs_local) {
-      card.append(el("p", { class: "cov-line warn", text: "Backups for this server go to S3 only, so \"Restore to a moment\" has nothing local to fold from. Time-travel still reads them. Set a backup folder to restore here." }));
+      card.append(el("p", { class: "cov-line warn", text: "Backups for this server go to S3 only, so \"Restore to a moment\" has nothing local to fold from. Time-travel still reads them. Set this server's backup dir to restore here." }));
     }
     if (c.offsite_tables && c.offsite_tables.length) {
       // Warn, not bad: the backup exists and Time-travel reads it from the

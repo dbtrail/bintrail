@@ -126,7 +126,7 @@ func TestGradeFullTable_anOffsiteAnchorDoesNotWidenTheRestoreWindow(t *testing.T
 		// A second offsite-only table, so the sort order of offsite_tables is
 		// asserted rather than hidden behind a single element.
 		{Schema: "shop", Table: "audit", SnapshotTime: now.Add(-3 * time.Hour), Path: "s3://bucket/prefix/2026/shop/audit.parquet"},
-	}, floor, now)
+	}, floor, now, true)
 
 	if got.from.Equal(now.Add(-2 * time.Hour)) {
 		t.Errorf("full_table_from advanced to the S3-only anchor. The console's Restore folds " +
@@ -169,7 +169,7 @@ func TestGradeFullTable_aStaleLocalCopyShadowsTheOffsiteOneAndStaysBroken(t *tes
 		{Schema: "shop", Table: "carts", SnapshotTime: now.Add(-150 * time.Hour), Path: "/backups/old/shop/carts.parquet"},
 		// Fresh, in the bucket, and unreachable because of the line above.
 		{Schema: "shop", Table: "carts", SnapshotTime: now.Add(-2 * time.Hour), Path: "s3://bucket/prefix/2026/shop/carts.parquet"},
-	}, floor, now)
+	}, floor, now, true)
 
 	if len(got.offsite) != 0 {
 		t.Errorf("offsite = %v, want none: the stale LOCAL copy is what findBaseline resolves, so "+
@@ -194,7 +194,7 @@ func TestGradeFullTable_aLocalAnchorStillCountsWhenS3AlsoHasIt(t *testing.T) {
 	got := gradeFullTable([]reconstruct.BaselineFile{
 		{Schema: "shop", Table: "orders", SnapshotTime: local, Path: "/backups/2026/shop/orders.parquet"},
 		{Schema: "shop", Table: "orders", SnapshotTime: now.Add(-time.Hour), Path: "s3://bucket/p/2026/shop/orders.parquet"},
-	}, floor, now)
+	}, floor, now, true)
 
 	if !got.from.Equal(local) {
 		t.Errorf("from = %s, want %s: the earliest usable LOCAL anchor is what Restore can reach", got.from, local)
@@ -213,9 +213,14 @@ func TestCoverageAPI_anS3OnlyServerStatesItOnceInsteadOfNamingEveryTable(t *test
 	latest := now.Add(-30 * time.Second)
 	part := now.Add(-100 * time.Hour).Format("p_2006010215")
 
-	// Only an s3:// source configured. It cannot be listed here, which is the
-	// point: the branch must be decided from the CONFIGURATION, before any
-	// listing, or an unreachable bucket and an S3-only server look the same.
+	// The listing of this bucket will fail; that is the point. The branch must
+	// be decided from the CONFIGURATION, before any listing, or an unreachable
+	// bucket and an S3-only server look the same.
+	//
+	// IMDS off so the credential chain fails immediately instead of spending
+	// seconds probing an instance-metadata endpoint that is not there. The
+	// listing has to fail either way, so this only removes the wait.
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 	srv := newBaselineServerWithFallback(t, "s3://bucket/prefix", "")
 	srv.cm.boot.db = coverageMockDB(t, part, latest, nil)
 	srv.cm.boot.dbName = "binlog_index"
@@ -248,14 +253,14 @@ func TestGradeFullTable_anUnattributableFloorStillNamesTheTable(t *testing.T) {
 	}
 
 	// Attributable floor: the same fixture is a plain broken verdict.
-	attributable := gradeFullTable(files, status.DeltaFloor{Hour: now.Add(-100 * time.Hour)}, now)
+	attributable := gradeFullTable(files, status.DeltaFloor{Hour: now.Add(-100 * time.Hour)}, now, true)
 	if !slices.Equal(attributable.broken, []string{"shop.carts"}) {
 		t.Fatalf("broken = %v, want [shop.carts] on an attributable floor", attributable.broken)
 	}
 
 	// Unattributable: below the floor may still be covered by that source's own
 	// archives, so the verdict softens. The NAME must not soften with it.
-	got := gradeFullTable(files, status.DeltaFloor{Hour: now.Add(-100 * time.Hour), BelowIsUnknown: true}, now)
+	got := gradeFullTable(files, status.DeltaFloor{Hour: now.Add(-100 * time.Hour), BelowIsUnknown: true}, now, true)
 	if len(got.broken) != 0 {
 		t.Errorf("broken = %v, want none: an unattributable floor must not accuse (#1219)", got.broken)
 	}
@@ -267,5 +272,61 @@ func TestGradeFullTable_anUnattributableFloorStillNamesTheTable(t *testing.T) {
 	if len(got.offsite) != 0 {
 		t.Errorf("offsite = %v, want none: the stale local copy still shadows the bucket, whatever "+
 			"the floor can attribute", got.offsite)
+	}
+}
+
+// With no local location configured, every usable table is offsite by
+// construction, so the list would name the whole schema and say nothing the
+// single restore_needs_local sentence does not. A warn line enumerating every
+// table is the kind operators learn to skip, and the next one they skip is a
+// real one.
+//
+// Stated as a property of the fold rather than blanked in the handler: the
+// handler calls reconstruct.ListBaselines directly with no seam, so an s3://
+// source there never lists and the assertion could not be reached at all.
+func TestGradeFullTable_withNoLocalLocationTheOffsiteListIsSuppressed(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	floor := status.DeltaFloor{Hour: now.Add(-100 * time.Hour)}
+	files := []reconstruct.BaselineFile{
+		{Schema: "shop", Table: "orders", SnapshotTime: now.Add(-time.Hour), Path: "s3://b/p/2026/shop/orders.parquet"},
+		{Schema: "shop", Table: "carts", SnapshotTime: now.Add(-2 * time.Hour), Path: "s3://b/p/2026/shop/carts.parquet"},
+	}
+
+	if got := gradeFullTable(files, floor, now, false); len(got.offsite) != 0 {
+		t.Errorf("offsite = %v, want none: with no local location every table is offsite and the "+
+			"enumeration is the whole schema", got.offsite)
+	}
+	// The complement, so the suppression is not simply "offsite is never
+	// populated": the same files with a local location configured DO enumerate.
+	if got := gradeFullTable(files, floor, now, true); len(got.offsite) != 2 {
+		t.Errorf("offsite = %v, want both tables: a server WITH a local directory needs to know "+
+			"which tables its Restore cannot fold", got.offsite)
+	}
+}
+
+// A dir-backed server must report restore_needs_local FALSE. Nothing asserted
+// the negative, and omitempty makes a spurious true invisible: hardcoding the
+// field survived the entire console suite, which would have told every
+// operator on the product that their backups go to S3 only.
+func TestCoverageAPI_aDirBackedServerDoesNotAskForALocalFolder(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	latest := now.Add(-30 * time.Second)
+	part := now.Add(-100 * time.Hour).Format("p_2006010215")
+	tsDir := now.Add(-time.Hour).Format("2006-01-02T15-04-05Z")
+
+	primary := t.TempDir()
+	writeBaselineFixture(t, primary, tsDir, "shop", "orders.parquet")
+
+	srv := newBaselineServerWithFallback(t, primary, "")
+	srv.cm.boot.db = coverageMockDB(t, part, latest, nil)
+	srv.cm.boot.dbName = "binlog_index"
+	got := coverageGet(t, srv)
+
+	if got.RestoreNeedsLocal {
+		t.Error("restore_needs_local is true on a server whose backups go to a local directory. " +
+			"The card would tell the operator their backups are S3-only and drop the offsite list")
+	}
+	if got.FullTableFrom == "" {
+		t.Error("a dir-backed server with a healthy backup must still report its restore window")
 	}
 }

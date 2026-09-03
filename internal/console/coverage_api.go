@@ -182,7 +182,7 @@ type fullTableVerdict struct {
 // index the hour is the live floor and an anchor below it is unattributable,
 // not broken (#1219). Grading with the bare hour would name healthy tables in
 // broken, the false alarm the floor's own narrowing exists to avoid.
-func gradeFullTable(files []reconstruct.BaselineFile, floor status.DeltaFloor, now time.Time) fullTableVerdict {
+func gradeFullTable(files []reconstruct.BaselineFile, floor status.DeltaFloor, now time.Time, hasLocalSource bool) fullTableVerdict {
 	anchors := make(map[string]*tableAnchors, len(files))
 	for _, f := range files {
 		k := f.Schema + "." + f.Table
@@ -236,7 +236,15 @@ func gradeFullTable(files []reconstruct.BaselineFile, floor status.DeltaFloor, n
 			// (#1541), so counting this anchor would print a start the button
 			// then refuses, while broken drives an alarm a backup that exists
 			// off site does not deserve.
-			v.offsite = append(v.offsite, k)
+			// Suppressed wholesale when NO local location is configured: every
+			// usable table is offsite by construction there, so the list would
+			// name the whole schema and say nothing the single
+			// restore_needs_local sentence does not. Decided here rather than
+			// blanked in the handler, so it is a property of the fold and a
+			// pure test can state it.
+			if hasLocalSource {
+				v.offsite = append(v.offsite, k)
+			}
 			continue
 		}
 		// No usable anchor at all: the newest one says which kind of nothing
@@ -345,12 +353,9 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 			resp.FullTableStatus = "unknown"
 			break
 		}
-		v := gradeFullTable(merged.Files, sum.Floor, now)
+		v := gradeFullTable(merged.Files, sum.Floor, now, !restoreNeedsLocal)
 		resp.FullTableStatus = "ok"
 		resp.BrokenTables, resp.OffsiteTables = v.broken, v.offsite
-		if restoreNeedsLocal {
-			resp.OffsiteTables = nil
-		}
 		if len(v.unevaluable) > 0 {
 			resp.FullTableStatus = "unknown"
 			resp.UnevaluableTables = v.unevaluable
