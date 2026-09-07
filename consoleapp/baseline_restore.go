@@ -9,6 +9,19 @@ import (
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
+// Point-in-time restore (the backups page's PITR action): fold the snapshot
+// at-or-before the chosen instant forward through the index's deltas and
+// publish the result as a NEW discoverable snapshot named by that instant.
+// It shares foldSnapshot with the periodic refresh — same all-or-nothing
+// publication, same sentinel-classified refusals (capture gap, destructive
+// DDL), and the same in-daemon resource posture: the conservative DuckDB
+// budget, a fixed table parallelism, and the volume warning turned on with
+// advice written for this binary rather than for the CLI (this is a daemon
+// that is also capturing; see executeRefresh's resource-posture comment and
+// the daemonFold* constants beside it).
+
+// TriggerRestore starts a restore, sharing the supervisor's per-server
+// single-flight with dumps and refreshes: all three write the same store.
 func (s *baselineSupervisor) TriggerRestore(req console.BaselineRestoreRequest) error {
 	s.mu.Lock()
 	if s.busyLocked(req.ServerID) {
@@ -25,6 +38,7 @@ func (s *baselineSupervisor) TriggerRestore(req console.BaselineRestoreRequest) 
 	return nil
 }
 
+// RestoreStatus reports the last restore for a server (idle if none ran here).
 func (s *baselineSupervisor) RestoreStatus(serverID string) console.BaselineStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -57,7 +71,7 @@ func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.restores[req.ServerID]
-	if st == nil {
+	if st == nil { // defensive; never cleared under lock
 		st = &console.BaselineStatus{}
 		s.restores[req.ServerID] = st
 	}
@@ -71,6 +85,8 @@ func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 				"tables", tables, "error", err)
 			return
 		}
+		// Warn, never Error: a refusal (gap, schema change) is the fail-closed
+		// contract working, and the operator picks another moment.
 		slog.Warn("baseline restore: published nothing", "server", req.ServerName, "id", req.ServerID,
 			"refused", refused, "error", err)
 		return
@@ -80,28 +96,53 @@ func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 		"at", req.At.UTC().Format(time.RFC3339))
 }
 
-// snapshotTablesAt is reconstruct.SnapshotTablesAt behind a seam, for the
-// reason newestSnapshotTables is: on an S3-backed server the listing reads the
+// snapshotAt is reconstruct.SnapshotAt behind a seam, for the reason
+// newestSnapshotTables is: on an S3-backed server the listing reads the
 // bucket, and a unit test that reached one would be neither hermetic nor
-// offline-safe. Written by tests only; the same restore-after-terminal rule
-// as foldTables applies.
-var snapshotTablesAt = reconstruct.SnapshotTablesAt
+// offline-safe. Written by tests only, and a test that replaces it must not
+// restore it until the job it started has reached a terminal state (the same
+// rule as foldTables).
+var snapshotAt = reconstruct.SnapshotAt
 
+// executeRestore folds toward the chosen instant. Unlike runRefresh it does
+// not reclaim the partial snapshot a refusal leaves behind: the operator who
+// asked is there to look at it (docs/dump-and-baseline.md says so), and the
+// daemon log names the directory. The table list comes from
+// the snapshot FindBaseline will anchor on (newest at-or-before At), NOT the
+// newest snapshot overall: restoring to a moment before the newest snapshot
+// must fold the older snapshot's tables.
+//
+// The list and the fold read the SAME location, derived once: the one
+// baselineFoldSource picks for the translated request, which is where the
+// scheduled update reads too (#1541) — the bucket on an S3-backed server, the
+// local directory otherwise. Listing req.BaselineDir here was the bug: on a
+// server whose backups are uploaded and pruned, or made by another host, the
+// local directory holds only what this daemon folded since it started, and
+// the refusal below fired while the bucket held dozens of backups. Deriving
+// the listing's source separately from the fold's would let the two name
+// different locations, and the fold would then refuse tables the list
+// promised.
 func (s *baselineSupervisor) executeRestore(req console.BaselineRestoreRequest) (tables, refused int, reuse reuseTally, err error) {
-	// The backup to fold from is looked for where the scheduled update looks
-	// (#1541): the bucket on an S3-backed server, the local directory
-	// otherwise. Listing req.BaselineDir here was the bug: on a server whose
-	// backups are uploaded and pruned, or made by another host, the local
-	// directory holds only what this daemon folded since it started, and the
-	// refusal below fired while the bucket held dozens of backups.
-	tableList, err := snapshotTablesAt(s.ctx, req.FoldSource(), req.At)
+	fold := restoreFoldRequest(req)
+	source := baselineFoldSource(fold)
+	tableList, anchor, err := snapshotAt(s.ctx, source, req.At)
 	if err != nil {
 		return 0, 0, reuseTally{}, fmt.Errorf("list the snapshot to restore from: %w", err)
 	}
 	if len(tableList) == 0 {
 		return 0, 0, reuseTally{}, fmt.Errorf("no backup exists at or before %s; a restore folds an existing backup forward, so pick a moment after your oldest backup", req.At.UTC().Format("2006-01-02 15:04:05"))
 	}
-	return s.foldSnapshot(restoreFoldRequest(req), req.At.UTC(), tableList)
+	if anchor.Equal(req.At.UTC()) {
+		// The handler refuses a COMPLETE local snapshot at exactly this
+		// instant before the job starts; this is the same refusal for the
+		// bucket, which the handler does not open. Without it the fold would
+		// rebuild that very snapshot and the upload would overwrite it in
+		// place, writing the _INCOMPLETE marker into a complete remote backup
+		// first, so a failure midway leaves the bucket copy hidden from every
+		// listing and nothing saying so.
+		return 0, 0, reuseTally{}, fmt.Errorf("a backup already exists at exactly %s in %s; pick another second, or use that backup", req.At.UTC().Format("2006-01-02 15:04:05"), source)
+	}
+	return s.foldSnapshot(fold, req.At.UTC(), tableList)
 }
 
 // restoreFoldRequest translates a restore request into the fold request the
@@ -137,7 +178,7 @@ func restoreFoldRequest(req console.BaselineRestoreRequest) refreshRequest {
 // keep their 403s).
 //
 // Restore rides EITHER opt-in deliberately, which looks like the derivation
-// the BaselineRestorer comment warns about — it is not.
+// the BaselineRestorer comment warns about — it is not. #1171's hazard was a
 // derived flag turning on a feature of a DIFFERENT class (a dump locks and
 // reads the source; mydumper may not exist). A restore is the same fold the
 // refresh already performs, into the same store, with no source contact,

@@ -266,11 +266,13 @@ func FullBackupPossible(e ServerEntry, gates BackupScheduleGates) error {
 // and ListBaselines both dispatch on the s3:// prefix, so the remote source
 // needs no separate code path here.
 //
-// Note this is NOT the source the console's own listing uses: newBundleDerived
+// Note this is NOT how time-travel resolves a baseline: bundle.findBaseline
 // prefers the local directory and treats the bucket only as a per-table
-// fallback, so on this shape the Backups page can show nothing while the fold
-// correctly finds the previous snapshot. That divergence predates #1539 and is
-// tracked separately; do not "fix" it by making the fold read local.
+// fallback (#766), so on a server with both, a table whose local copy is
+// stale is read stale by time-travel and fresh by the fold. The Backups
+// listing merges both locations (#1571) and the point-in-time restore reads
+// this same source (#1541); do not "fix" the divergence by making the fold
+// read local.
 //
 // The OUTPUT stays local whatever this returns: the fold writes Parquet to a
 // filesystem, and the upload is a separate step afterwards.

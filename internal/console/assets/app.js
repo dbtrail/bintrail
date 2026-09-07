@@ -1172,7 +1172,7 @@ function covCard(c, stamp) {
       card.append(el("p", { class: "cov-line bad", text: "Not fully restorable (newest backup predates coverage): " + c.broken_tables.join(", ") + ". Take a fresh backup." }));
     }
     if (c.restore_needs_local) {
-      card.append(el("p", { class: "cov-line warn", text: "Backups for this server go to S3 only, so \"Restore to a moment\" has nothing local to fold from. Time-travel still reads them. Set this server's backup dir to restore here." }));
+      card.append(el("p", { class: "cov-line warn", text: "Backups for this server go to S3 only, so \"Restore to a moment\" has no local folder to build into. Time-travel still reads them. Set this server's backup dir to restore here." }));
     }
     if (c.unreachable_tables && c.unreachable_tables.length) {
       // Warn, not bad: the backup exists and Time-travel reads it (local
@@ -6014,13 +6014,18 @@ function backupRestoreCard(cur, b, restoreSt) {
   // Registry servers only: the CLI (ephemeral) entry is refused by the
   // monitor verbs with a message about monitoring, not restores.
   if (!capsCache.baseline_restore || !cur || !cur.id || cur.kind !== "registry") return null;
-  // The server needs its OWN local backup directory: the daemon-wide one is a
-  // shared store the endpoint refuses (the fold would mix servers).
+  // The server needs its OWN local backup directory to build INTO: the
+  // daemon-wide one is a shared store the endpoint refuses (the fold would mix
+  // servers).
   if (!cur.baseline_dir) return null;
-  if (!b || b.error || !b.configured || b.kind !== "dir") return null;
-  // The LOCAL ones: the card is already gated on the server having its own
-  // baseline_dir, so that is the directory executeRestore will read.
-  const usable = backupSnapshotsFor(b, "dir");
+  if (!b || b.error || !b.configured) return null;
+  // Where the restore READS is the other half (#1541): this server's S3
+  // backups when it has them, else that directory — the same rule the
+  // scheduled update follows (BaselineFoldSource), and the same one the
+  // coverage card reports as restore_reads. Offering the local-only rows on an
+  // S3-backed server would prefill a moment the fold then refuses.
+  const reads = cur.baseline_s3 ? "s3" : "dir";
+  const usable = backupSnapshotsFor(b, reads);
   if (!usable.length) return null;
   const rst = restoreSt && restoreSt.restore;
   if (rst && rst.state === "running") return null; // the run region owns it
@@ -6037,11 +6042,15 @@ function backupRestoreCard(cur, b, restoreSt) {
   msg.hidden = true;
   go.onclick = () => startBackupRestore(cur.id, input.value.trim(), go, msg);
   body.append(el("div", { class: "bk-restore-row" }, input, go), msg);
-  const elsewhere = backupElsewhereNote(b, usable);
+  const elsewhere = backupElsewhereNote(b, usable, reads);
   if (elsewhere) body.append(elsewhere);
   if (rst && rst.state === "failed") {
-    body.append(el("p", { class: "form-msg err", text:
-      "Last restore published nothing: " + backupFoldError(rst.last_error || "unknown error") + " Nothing was overwritten." }));
+    // published means the fold finished and the snapshot is on disk, and only
+    // sending it to S3 failed (#1541). "Published nothing" there is false: the
+    // backup is in the list below and can be restored from.
+    body.append(el("p", { class: "form-msg err", text: rst.published
+      ? "Last restore wrote the backup on this machine but could not send it to S3: " + backupFoldError(rst.last_error || "unknown error") + " The backup is in the list below. A full backup sends it along with the rest."
+      : "Last restore published nothing: " + backupFoldError(rst.last_error || "unknown error") + " Nothing was overwritten." }));
     details.open = true;
   } else if (rst && rst.state === "succeeded") {
     // The reused count belongs here for the same reason it belongs on the
@@ -6239,29 +6248,29 @@ async function downloadNewestBackup(at, btn) {
 // backupSnapshotsFor narrows the listing to the snapshots a JOB can actually
 // fold from (#1542).
 //
-// The Backups list now merges every location, but the restore and .sql-export
-// jobs still read ONE: executeRestore calls SnapshotTablesAt(req.BaselineDir),
-// and the export picks the local directory whenever the server has one. So a
-// card prefilled with the newest row can now name a snapshot that exists only
-// in the bucket, and the job would refuse it while the page above says it is
-// right there. Listing more must not mean offering more than the job can do.
-//
-// The full answer is folding from S3 (#1541); until then the restore card and
-// the .sql lane offer what
-// works and say what they left out.
+// The Backups list merges every location, but each job reads ONE: the restore
+// reads this server's S3 backups when it has them, else its directory
+// (#1541, the scheduled update's rule), and the .sql export picks the local
+// directory whenever the server has one. So a card prefilled with the newest
+// row could name a snapshot that exists only in the other location, and the
+// job would refuse it while the page above says it is right there. Listing
+// more must not mean offering more than the job can do: each lane offers
+// what its job reads and says what it left out.
 function backupSnapshotsFor(b, kind) {
   return ((b && b.snapshots) || []).filter((s) => !s.kinds || !s.kinds.length || s.kinds.includes(kind));
 }
 
 // backupElsewhereNote names the snapshots a caller had to skip, so a shorter
-// dropdown than the list above it is explained rather than merely odd.
-function backupElsewhereNote(b, usable) {
+// dropdown than the list above it is explained rather than merely odd. kind is
+// what the caller's job reads; the skipped ones are in the other location.
+function backupElsewhereNote(b, usable, kind) {
   const all = ((b && b.snapshots) || []).length;
   if (!all || usable.length >= all) return null;
   const n = all - usable.length;
-  return el("p", { class: "form-hint", text:
-    n + " backup" + (n === 1 ? " is" : "s are") + " kept only in S3. This builds from the local folder, so it cannot start from " +
-    (n === 1 ? "that one" : "those") + " yet." });
+  const one = n === 1;
+  return el("p", { class: "form-hint", text: kind === "s3"
+    ? n + " backup" + (one ? " is" : "s are") + " kept only on this host, not in S3. This builds from this server's S3 backups, so it cannot start from " + (one ? "that one" : "those") + "."
+    : n + " backup" + (one ? " is" : "s are") + " kept only in S3. This builds from the local folder, so it cannot start from " + (one ? "that one" : "those") + "." });
 }
 
 function backupSQLLane(cur, b, sqlSt) {
@@ -6277,7 +6286,8 @@ function backupSQLLane(cur, b, sqlSt) {
   // Borrowing the restore card's gate was the mistake: cur.baseline_dir is
   // right THERE, because the restore endpoint refuses the shared daemon store
   // on purpose (the fold would mix servers). This one accepts it, and says so.
-  const usable = backupSnapshotsFor(b, b.kind === "dir" ? "dir" : "s3");
+  const reads = b.kind === "dir" ? "dir" : "s3";
+  const usable = backupSnapshotsFor(b, reads);
   if (!usable.length) return null;
   const st = sqlSt && sqlSt.sql_export;
   const lane = backupLane("To load into MySQL",
@@ -6303,7 +6313,7 @@ function backupSQLLane(cur, b, sqlSt) {
   go.onclick = () => startSQLExport(cur.id, input.value.trim(), go, msg);
   body.append(el("div", { class: "bk-restore-row" }, input, go), msg);
   if (b.kind === "dir") {
-    const elsewhere = backupElsewhereNote(b, usable);
+    const elsewhere = backupElsewhereNote(b, usable, reads);
     if (elsewhere) body.append(elsewhere);
   }
   if (st && st.state === "failed") {

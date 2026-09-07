@@ -149,8 +149,8 @@ type BaselineRestoreRequest struct {
 	// and where it reads the backup to fold from when BaselineS3 is empty.
 	BaselineDir string
 	// BaselineS3 is the server's configured S3 destination, or empty. When
-	// set, the backup to fold from is looked for in the bucket (see
-	// FoldSource) and the finished snapshot is uploaded there, so the restore
+	// set, the backup to fold from is looked for in the bucket (the
+	// BaselineFoldSource rule) and the finished snapshot is uploaded there, so the restore
 	// behaves like the scheduled update on the same server (#1541). Before it
 	// was carried, the restore listed the local directory alone, which on an
 	// S3-backed server holds only what this daemon folded since it started,
@@ -162,17 +162,6 @@ type BaselineRestoreRequest struct {
 	// same store, so it honours the same operator choice; leaving it out is
 	// how the two silently diverged.
 	CarryForwardUnchanged bool
-}
-
-// FoldSource is where the restore reads the backup it folds forward: the
-// bucket when the server has one, else the local directory. The same rule as
-// BaselineFoldSource, on the request rather than the registry entry, so the
-// consumer in consoleapp cannot re-derive it differently.
-func (r BaselineRestoreRequest) FoldSource() string {
-	if r.BaselineS3 != "" {
-		return r.BaselineS3
-	}
-	return r.BaselineDir
 }
 
 type BaselineStatus struct {
@@ -311,9 +300,9 @@ func (s *Server) handleBaselineRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if e.BaselineDir == "" {
-		// Same constraint as the periodic refresh: the fold reads the previous
-		// snapshot and writes the new one on disk, so it needs the SERVER'S OWN
-		// local directory. The daemon-level --baseline-dir is deliberately not
+		// Same constraint as the periodic refresh: the fold WRITES the new
+		// snapshot on disk (it reads the previous one from the bucket when the
+		// server has one, #1541), so it needs the SERVER'S OWN local directory. The daemon-level --baseline-dir is deliberately not
 		// a fallback here: it is a shared store, and folding this server's
 		// index onto another server's snapshots would publish a backup that
 		// belongs to neither.

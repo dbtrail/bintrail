@@ -73,7 +73,8 @@ type coverageResponse struct {
 	// RestoreReads names the location the Restore button folds from: "s3"
 	// when the server has an S3 destination (the same rule the scheduled
 	// update follows, BaselineFoldSource, #1541), "dir" when it has only a
-	// local directory, "" when it has neither of its own (Restore refuses).
+	// local directory, "" when Restore refuses the server outright — no
+	// local directory of its own to fold INTO, whatever it reads from.
 	// Time-travel reads the other way round (local first, bucket on a miss,
 	// #766), which is why this card says which location it graded against.
 	RestoreReads string `json:"restore_reads,omitempty"`
@@ -90,9 +91,9 @@ type coverageResponse struct {
 	// then refuses with "no backup exists at or before".
 	UnreachableTables []string `json:"unreachable_tables,omitempty"`
 	// RestoreNeedsLocal marks a server whose backups go ONLY to S3: the Restore
-	// button needs a local backup directory to fold from and refuses outright
-	// without one, so no per-table finding applies and offsite_tables is left
-	// empty rather than naming the entire schema.
+	// button needs a local backup directory to fold INTO and refuses outright
+	// without one, so no per-table finding applies and unreachable_tables is
+	// left empty rather than naming the entire schema.
 	RestoreNeedsLocal bool `json:"restore_needs_local,omitempty"`
 	// UnevaluableTables: tables whose coverage could not be decided. They are
 	// why full_table_status is "unknown", and naming them is the whole point.
@@ -135,14 +136,17 @@ type tableAnchors struct {
 	newest                  time.Time
 	earliestUsable          time.Time
 	earliestUsableReachable time.Time
-	// hasLocal and newestLocal describe the LOCAL copies alone, and they decide
-	// whether an offsite anchor is reachable by anything at all.
+	// hasLocal and newestLocal describe the LOCAL copies alone. On a server
+	// whose Restore reads the local directory they decide whether a fresh copy
+	// in a bucket is reachable by anything at all:
 	//
 	// bundle.findBaseline falls back to the bucket only on ErrNoBaseline (#766).
 	// A table with ANY local snapshot at-or-before the requested instant gets a
 	// nil error from the local root, so the fallback never fires and time travel
-	// resolves the STALE local copy. Its fresh S3 sibling is unreachable from
-	// every console surface, which is the pre-#1571 verdict: broken.
+	// resolves the STALE local copy. Under reach kind "dir" its fresh S3 sibling
+	// is then unreachable from every console surface, which is the pre-#1571
+	// verdict: broken. Under "s3" Restore folds that sibling from the bucket,
+	// so the same shape is restorable and this pair is not consulted.
 	hasLocal    bool
 	newestLocal time.Time
 }
@@ -185,10 +189,12 @@ type fullTableVerdict struct {
 // restoreReach is the location the Restore button folds from, and the
 // evidence needed to tell whether a listed file is in it.
 //
-// kind follows BaselineFoldSource's rule on the server's OWN locations: "s3"
-// when it has an S3 destination, "dir" when only a local directory, "" when
-// neither (Restore refuses that server, so nothing is reachable and the
-// unreachable list is suppressed: restore_needs_local says it once).
+// kind follows BaselineFoldSource's rule on the server's OWN locations, and
+// restoreReadsFrom's refusal rule on top: "s3" when it has a local directory
+// AND an S3 destination, "dir" when only a local directory, "" when it has no
+// local directory of its own — Restore refuses that server outright, so
+// nothing is reachable and the unreachable list is suppressed
+// (restore_needs_local, decided from the bundle's sources, says it once).
 //
 // inS3 is needed because the merged listing keeps the LOCAL path for a file
 // present in both locations (the footer read wants it), so under "s3" the
@@ -199,16 +205,21 @@ type restoreReach struct {
 }
 
 // restoreReadsFrom classifies where the Restore button reads for a server
-// with these locations of its own. The same precedence as BaselineFoldSource;
-// kept as a separate pure function so the card and the fold cannot drift.
+// with these locations of its own: the precedence of BaselineFoldSource,
+// after handleBaselineRestore's own gate. That gate comes first: with no
+// local directory the fold has nowhere to WRITE and the button refuses, so
+// an S3-only server reads from nothing, not from the bucket — grading it as
+// "s3" would print a restore window next to a refusal. The card and the fold
+// are separate functions and MUST agree; TestRestoreReadsFrom pins them
+// against each other.
 func restoreReadsFrom(dir, s3 string) string {
 	switch {
+	case dir == "":
+		return ""
 	case s3 != "":
 		return "s3"
-	case dir != "":
-		return "dir"
 	}
-	return ""
+	return "dir"
 }
 
 func (r restoreReach) reaches(f reconstruct.BaselineFile) bool {
@@ -294,10 +305,11 @@ func gradeFullTable(files []reconstruct.BaselineFile, reach restoreReach, floor 
 			// not called broken: counting this anchor would print a start the
 			// button then refuses, while broken drives an alarm a backup that
 			// exists does not deserve. Time-travel reads it either way (#766).
-			// Suppressed wholesale when the server has no location of its own
-			// to restore into: every usable table is unreachable by
-			// construction there, so the list would name the whole schema and
-			// say nothing the single restore_needs_local sentence does not.
+			// Suppressed wholesale when the server has no local directory of
+			// its own to restore into: Restore refuses it outright, every
+			// usable table is unreachable by construction, and the list would
+			// name the whole schema and say nothing the single
+			// restore_needs_local sentence does not.
 			// Decided here rather than blanked in the handler, so it is a
 			// property of the fold and a pure test can state it.
 			if reach.kind != "" {
@@ -395,11 +407,14 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 		resp.RestoreNeedsLocal = restoreNeedsLocal
 		// Where the Restore button reads, from the server's OWN locations
 		// (handleBaselineRestore uses the entry, never the daemon-wide
-		// defaults). The boot entry has none; its bundle's sources classify
-		// the same way so the card still grades a --baseline-dir/--baseline-s3
-		// console, on which Restore is refused for a different reason (#1602).
+		// defaults). A server with no location of its own — the boot entry,
+		// or a registry entry inheriting --baseline-dir/--baseline-s3 — is
+		// graded from its bundle's sources instead, which classify the same
+		// way: Restore refuses those servers for a different reason (#1602),
+		// and grading them as reading nothing would render the "no usable
+		// baseline exists yet" shape over a backup that is there.
 		reads := restoreReadsFrom(bundleBaselineDir(b), bundleBaselineS3(b))
-		if e, ok := s.selectedEntry(r); ok {
+		if e, ok := s.selectedEntry(r); ok && (e.BaselineDir != "" || e.BaselineS3 != "") {
 			reads = restoreReadsFrom(e.BaselineDir, e.BaselineS3)
 		}
 		resp.RestoreReads = reads

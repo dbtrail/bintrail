@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Point-in-time restore folds from the server's S3 backups** (#1541). The
+  console's Restore listed the backup to fold from in the server's local
+  directory only, which on an S3-backed server holds what this daemon folded
+  since it started, so every backup that was uploaded and pruned, or made by
+  another host, was invisible and the restore refused with "no backup exists
+  at or before" while the bucket held dozens. It now reads where the scheduled
+  update reads (`BaselineFoldSource`: the bucket when the server has one, the
+  local directory otherwise), still writes into the local directory, and
+  uploads the result so retention can reclaim it; a failed upload keeps the
+  local snapshot and says so, and a restore at the exact second of a backup
+  the bucket already holds is refused rather than overwriting it. The
+  Overview coverage card, which was graded on the old behaviour, now grades
+  against the location the button actually reads: `GET /api/coverage` gains
+  `restore_reads` (`s3`/`dir`, empty when the server has no local directory
+  and Restore refuses it), and `offsite_tables` is **renamed**
+  `unreachable_tables`, whose meaning mirrors per server — on a `dir` server,
+  tables backed up only in a daemon-wide bucket; on an `s3` server, tables
+  backed up only on this host, which the daemon-wide refresh interval and a
+  failed upload both produce. The Backups page's restore lane offers the
+  snapshots the fold reads, and says which location the skipped ones are in.
+
 ### Added
 - **`doctor` warns about tables with no primary key** (#1608). Those tables are
   not captured at all: the first snapshot REFUSES outright and the stream does

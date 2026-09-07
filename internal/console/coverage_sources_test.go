@@ -349,6 +349,10 @@ func TestCoverageAPI_anS3OnlyServerStatesItOnceInsteadOfNamingEveryTable(t *test
 		t.Error("restore_needs_local is false: the operator gets no explanation for a card with " +
 			"no restore window, on a server where Restore refuses outright for want of a local folder")
 	}
+	if got.RestoreReads != "" {
+		t.Errorf("restore_reads = %q, want empty: Restore refuses this server, so the card must not "+
+			"claim to grade against the bucket next to that refusal", got.RestoreReads)
+	}
 }
 
 func TestGradeFullTable_anUnattributableFloorStillNamesTheTable(t *testing.T) {
@@ -391,9 +395,9 @@ func TestGradeFullTable_withNoLocationOfItsOwnTheUnreachableListIsSuppressed(t *
 		{Schema: "shop", Table: "carts", SnapshotTime: now.Add(-2 * time.Hour), Path: "s3://b/p/2026/shop/carts.parquet"},
 	}
 
-	if got := gradeFullTable(files, restoreReach{}, floor, now); len(got.unreachable) != 0 {
-		t.Errorf("unreachable = %v, want none: with no location of its own every table is unreachable "+
-			"and the enumeration is the whole schema", got.unreachable)
+	if got := gradeFullTable(files, restoreReach{}, floor, now); len(got.unreachable) != 0 || !got.from.IsZero() {
+		t.Errorf("unreachable = %v from = %s, want none and no window: Restore refuses this server, so "+
+			"a start would sit next to a button that cannot run, and the enumeration is the whole schema", got.unreachable, got.from)
 	}
 
 	// The complement, so the suppression is not simply "unreachable is never
@@ -404,18 +408,26 @@ func TestGradeFullTable_withNoLocationOfItsOwnTheUnreachableListIsSuppressed(t *
 	}
 }
 
-// restoreReadsFrom is the card's copy of BaselineFoldSource's precedence; the
-// two are pinned against each other so the card cannot grade against a
-// location the fold does not open.
+// restoreReadsFrom is the card's copy of BaselineFoldSource's precedence,
+// behind handleBaselineRestore's refusal; the three are pinned against each
+// other so the card cannot grade against a location the button does not open.
+// An S3-only server is the case that matters: the fold source WOULD be the
+// bucket, but the button refuses for want of a directory to write into
+// (rebuildPossible says the same), so the card must read from nothing.
 func TestRestoreReadsFrom_agreesWithBaselineFoldSource(t *testing.T) {
 	for _, tc := range []struct{ dir, s3, want string }{
-		{"/b", "", "dir"}, {"/b", "s3://k/p/", "s3"}, {"", "s3://k/p/", "s3"}, {"", "", ""},
+		{"/b", "", "dir"}, {"/b", "s3://k/p/", "s3"}, {"", "s3://k/p/", ""}, {"", "", ""},
 	} {
 		got := restoreReadsFrom(tc.dir, tc.s3)
 		if got != tc.want {
 			t.Errorf("restoreReadsFrom(%q,%q) = %q, want %q", tc.dir, tc.s3, got, tc.want)
 		}
-		if src := BaselineFoldSource(ServerEntry{BaselineDir: tc.dir, BaselineS3: tc.s3}); src != "" && baselineKindOf(src) != got {
+		e := ServerEntry{DSN: "d", BaselineDir: tc.dir, BaselineS3: tc.s3}
+		refused := rebuildPossible(e) != nil
+		if refused != (got == "") {
+			t.Errorf("rebuildPossible refuses=%v but the card reads %q: the two must agree on WHETHER a restore runs", refused, got)
+		}
+		if src := BaselineFoldSource(e); !refused && baselineKindOf(src) != got {
 			t.Errorf("BaselineFoldSource picks %q (%s) but the card grades against %q", src, baselineKindOf(src), got)
 		}
 	}
@@ -497,5 +509,49 @@ func TestCoverageAPI_restoreReadsComesFromTheServersOwnEntry(t *testing.T) {
 	}
 	if got.RestoreNeedsLocal {
 		t.Error("restore_needs_local is true on a server that has a local directory to fold into")
+	}
+}
+
+// A registry server that names NO backup location of its own inherits the
+// daemon-wide one through its bundle. Restore refuses it (#1602), but the card
+// grading it as reading nothing would render the "no usable baseline exists
+// yet" shape — no window, no unreachable list, no restore_reads — over a
+// backup that is there and that time-travel reads. It grades from the bundle's
+// sources instead, as the boot entry does, and keeps the window it reported
+// before #1541.
+func TestCoverageAPI_anEntryInheritingTheDaemonDirKeepsItsWindow(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	latest := now.Add(-30 * time.Second)
+	part := now.Add(-100 * time.Hour).Format("p_2006010215")
+	tsDir := now.Add(-time.Hour).Format("2006-01-02T15-04-05Z")
+
+	reg, err := LoadRegistry(t.TempDir() + "/console-servers.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg, MonitorCtrl: &stubMonitorCtrl{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := reg.Add(ServerEntry{Name: "wp", DSN: "idx:pw@tcp(127.0.0.1:3306)/idx", SourceDSN: "src:pw@tcp(127.0.0.1:3306)/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemonDir := t.TempDir()
+	writeBaselineFixture(t, daemonDir, tsDir, "shop", "orders.parquet")
+	srv.cm.bundles[e.ID] = &bundle{db: coverageMockDB(t, part, latest, nil), dbName: "binlog_index",
+		baselineSrc: daemonDir, baselineConfigured: true}
+
+	rec, body := doServersReqHeader(t, srv, "GET", "/api/coverage", "", e.ID)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, body)
+	}
+	var got coverageResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.RestoreReads != "dir" || got.FullTableFrom == "" {
+		t.Errorf("restore_reads = %q full_table_from = %q, want dir and a window: the inherited "+
+			"directory holds a healthy backup, and reading nothing would erase it from the card", got.RestoreReads, got.FullTableFrom)
 	}
 }

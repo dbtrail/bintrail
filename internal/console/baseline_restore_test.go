@@ -343,9 +343,6 @@ func TestBaselineRestore_carriesTheServersS3Destination(t *testing.T) {
 				t.Errorf("request carried dir=%q s3=%q, want dir=%q s3=%q",
 					stub.last.BaselineDir, stub.last.BaselineS3, dir, tc.s3)
 			}
-			if got := stub.last.FoldSource(); got != BaselineFoldSource(ServerEntry{BaselineDir: dir, BaselineS3: tc.s3}) {
-				t.Errorf("FoldSource() = %q, disagrees with BaselineFoldSource for the same server", got)
-			}
 		})
 	}
 }

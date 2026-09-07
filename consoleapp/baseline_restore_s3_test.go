@@ -26,16 +26,18 @@ var restoreAt = time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 // listing, which is what the local-only case depends on.
 func stubS3Restore(t *testing.T, bucketTables []string, uploadErr error) (listed *[]string, folded *[]reconstruct.FullTableConfig, uploads *[]uploadCall) {
 	t.Helper()
-	realList, realFold, realUpload := snapshotTablesAt, foldTables, uploadSnapshot
-	t.Cleanup(func() { snapshotTablesAt, foldTables, uploadSnapshot = realList, realFold, realUpload })
+	realList, realFold, realUpload := snapshotAt, foldTables, uploadSnapshot
+	t.Cleanup(func() { snapshotAt, foldTables, uploadSnapshot = realList, realFold, realUpload })
 
 	var srcs []string
-	snapshotTablesAt = func(ctx context.Context, src string, at time.Time) ([]string, error) {
+	snapshotAt = func(ctx context.Context, src string, at time.Time) ([]string, time.Time, error) {
 		if !strings.HasPrefix(src, "s3://") {
 			return realList(ctx, src, at)
 		}
 		srcs = append(srcs, src)
-		return bucketTables, nil
+		// The bucket's newest snapshot at-or-before at sits an hour earlier,
+		// unless a case asks for a collision (see bucketAnchor).
+		return bucketTables, bucketAnchor(at), nil
 	}
 	var cfgs []reconstruct.FullTableConfig
 	foldTables = func(_ context.Context, cfg reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
@@ -49,6 +51,19 @@ func stubS3Restore(t *testing.T, bucketTables []string, uploadErr error) (listed
 		return 1, uploadErr
 	}
 	return &srcs, &cfgs, &ups
+}
+
+// bucketAnchor is the snapshot time the stubbed bucket reports for a restore
+// to at: an hour earlier by default. A case sets bucketCollides so the stub
+// answers with at itself, the shape of an operator typing the exact second
+// of a backup the bucket already holds.
+var bucketCollides bool
+
+func bucketAnchor(at time.Time) time.Time {
+	if bucketCollides {
+		return at
+	}
+	return at.Add(-time.Hour)
 }
 
 // runRestoreFor drives one whole restore synchronously and returns what it
@@ -71,7 +86,13 @@ func runRestoreFor(t *testing.T, req console.BaselineRestoreRequest) (string, co
 	sup.history = h
 	sup.restores[req.ServerID] = &console.BaselineStatus{State: "running"}
 	sup.runRestore(req)
-	return buf.String(), sup.RestoreStatus(req.ServerID), h.FindBySnapshot(req.ServerID, req.At.UTC().Format(time.RFC3339))
+	// A refused run records no snapshot time, so it is found by position, not
+	// by snapshot: the run is the only one this history holds.
+	var rec *console.BaselineRunRecord
+	if runs := h.List(req.ServerID); len(runs) == 1 {
+		rec = &runs[0]
+	}
+	return buf.String(), sup.RestoreStatus(req.ServerID), rec
 }
 
 // The whole of #1541 end to end: on a server whose backups go to S3, a
@@ -199,5 +220,36 @@ func TestRestoreFoldRequest_carriesTheS3Destination(t *testing.T) {
 		if got.ServerID != "srv1" || got.ServerName != "wp" || got.IndexDSN != "dsn" || got.BaselineDir != "/b" {
 			t.Errorf("the restore request did not translate: %+v", got)
 		}
+	}
+}
+
+// A restore at the EXACT second of a backup the bucket already holds is
+// refused before anything runs. The handler's own 409 covers a complete local
+// snapshot at that instant; it never opens the bucket, and without this check
+// the fold would rebuild that snapshot and the upload would overwrite it in
+// place, _INCOMPLETE marker first, so a failure midway hides a complete
+// remote backup from every listing (#1541).
+func TestRunRestore_refusesTheExactInstantOfABackupTheBucketHolds(t *testing.T) {
+	local := t.TempDir()
+	listed, folded, uploads := stubS3Restore(t, []string{"shop.orders"}, nil)
+	bucketCollides = true
+	t.Cleanup(func() { bucketCollides = false })
+
+	_, st, rec := runRestoreFor(t, console.BaselineRestoreRequest{
+		ServerID: "s", ServerName: "s", IndexDSN: "d",
+		BaselineDir: local, BaselineS3: "s3://bucket/backups/", At: restoreAt,
+	})
+
+	if st.State != "failed" || st.Published {
+		t.Fatalf("status = %+v, want failed and NOT published: nothing may be written", st)
+	}
+	if !strings.Contains(st.LastError, "already exists at exactly") || !strings.Contains(st.LastError, "s3://bucket/backups/") {
+		t.Fatalf("last error = %q, want the collision named with its location", st.LastError)
+	}
+	if len(*listed) != 1 || len(*folded) != 0 || len(*uploads) != 0 {
+		t.Fatalf("listed=%d folded=%d uploads=%d, want the listing only: the fold and the upload must not run", len(*listed), len(*folded), len(*uploads))
+	}
+	if rec == nil || rec.SnapshotTime != "" || !strings.Contains(rec.Error, "already exists") {
+		t.Fatalf("history record = %+v, want no snapshot time and the refusal", rec)
 	}
 }
