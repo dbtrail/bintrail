@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Overview coverage card, which was graded on the old behaviour, now grades
   against the location the button actually reads: `GET /api/coverage` gains
   `restore_reads` (`s3`/`dir`, empty when the server has no local directory
-  and Restore refuses it), and `offsite_tables` is **renamed**
+  and Restore refuses it, `inherited` when it grades the daemon-wide locations), and `offsite_tables` is **renamed**
   `unreachable_tables`, whose meaning mirrors per server — on a `dir` server,
   tables backed up only in a daemon-wide bucket; on an `s3` server, tables
   backed up only on this host, which the daemon-wide refresh interval and a

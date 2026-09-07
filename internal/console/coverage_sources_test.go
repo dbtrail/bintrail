@@ -455,8 +455,9 @@ func TestCoverageAPI_aDirBackedServerDoesNotAskForALocalFolder(t *testing.T) {
 		t.Error("restore_needs_local is true on a server whose backups go to a local directory. " +
 			"The card would tell the operator their backups are S3-only and drop the unreachable list")
 	}
-	if got.RestoreReads != "dir" {
-		t.Errorf("restore_reads = %q, want dir: the card must say which location it graded against", got.RestoreReads)
+	if got.RestoreReads != "inherited" {
+		t.Errorf("restore_reads = %q, want inherited: the boot server names no location of its own, so "+
+			"the card graded the daemon-wide directory, and Restore is refused for it (#1602)", got.RestoreReads)
 	}
 	if got.FullTableFrom == "" {
 		t.Error("a dir-backed server with a healthy backup must still report its restore window")
@@ -550,8 +551,9 @@ func TestCoverageAPI_anEntryInheritingTheDaemonDirKeepsItsWindow(t *testing.T) {
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.RestoreReads != "dir" || got.FullTableFrom == "" {
-		t.Errorf("restore_reads = %q full_table_from = %q, want dir and a window: the inherited "+
-			"directory holds a healthy backup, and reading nothing would erase it from the card", got.RestoreReads, got.FullTableFrom)
+	if got.RestoreReads != "inherited" || got.FullTableFrom == "" {
+		t.Errorf("restore_reads = %q full_table_from = %q, want inherited and a window: the inherited "+
+			"directory holds a healthy backup, so reading nothing would erase it from the card, and "+
+			"calling it dir would claim a Restore button the server does not get (#1602)", got.RestoreReads, got.FullTableFrom)
 	}
 }

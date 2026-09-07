@@ -253,3 +253,33 @@ func TestRunRestore_refusesTheExactInstantOfABackupTheBucketHolds(t *testing.T) 
 		t.Fatalf("history record = %+v, want no snapshot time and the refusal", rec)
 	}
 }
+
+// The collision is decided by the directory NAME, not the instant: a caller
+// that hands the job a fractional second (the console truncates, another
+// caller might not) must still be refused when the whole second is taken.
+func TestRunRestore_refusesTheCollisionByDirectoryNameNotInstant(t *testing.T) {
+	local := t.TempDir()
+	_, folded, uploads := stubS3Restore(t, []string{"shop.orders"}, nil)
+	bucketCollides = true
+	t.Cleanup(func() { bucketCollides = false })
+	realList := snapshotAt
+	// The bucket answers with the WHOLE second while the request carries a
+	// fraction of it: Equal would say "different", the directory says "same".
+	snapshotAt = func(ctx context.Context, src string, at time.Time) ([]string, time.Time, error) {
+		tables, anchor, err := realList(ctx, src, at)
+		return tables, anchor.Truncate(time.Second), err
+	}
+	t.Cleanup(func() { snapshotAt = realList })
+
+	_, st, _ := runRestoreFor(t, console.BaselineRestoreRequest{
+		ServerID: "s", ServerName: "s", IndexDSN: "d",
+		BaselineDir: local, BaselineS3: "s3://bucket/backups/", At: restoreAt.Add(500 * time.Millisecond),
+	})
+
+	if st.State != "failed" || st.Published || !strings.Contains(st.LastError, "already exists at exactly") {
+		t.Fatalf("status = %+v, want the collision refusal", st)
+	}
+	if len(*folded) != 0 || len(*uploads) != 0 {
+		t.Fatalf("folded=%d uploads=%d, want neither: the bucket's 10:00:00 snapshot would be overwritten", len(*folded), len(*uploads))
+	}
+}

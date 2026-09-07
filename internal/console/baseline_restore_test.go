@@ -346,3 +346,21 @@ func TestBaselineRestore_carriesTheServersS3Destination(t *testing.T) {
 		})
 	}
 }
+
+// A fractional second in `at` used to slip past every "already exists at
+// exactly" guard: Go's parser accepts "10:00:00.5" against a layout with no
+// fraction, the snapshot at 10:00:00 is at-or-before it, and the fold names
+// its output by the whole second, so it would overwrite that snapshot in
+// place (#1541). The instant is truncated at the boundary so every consumer
+// agrees on the second.
+func TestParseSnapshotAt_truncatesToTheSecond(t *testing.T) {
+	for _, raw := range []string{"2026-09-07 10:00:00.5", "2026-09-07T10:00:00.5Z"} {
+		got, ok := parseSnapshotAt(raw)
+		if !ok {
+			t.Fatalf("%q did not parse", raw)
+		}
+		if got.Nanosecond() != 0 || !got.Equal(time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)) {
+			t.Errorf("%q -> %s, want the whole second", raw, got.Format(time.RFC3339Nano))
+		}
+	}
+}

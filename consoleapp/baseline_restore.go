@@ -132,7 +132,11 @@ func (s *baselineSupervisor) executeRestore(req console.BaselineRestoreRequest) 
 	if len(tableList) == 0 {
 		return 0, 0, reuseTally{}, fmt.Errorf("no backup exists at or before %s; a restore folds an existing backup forward, so pick a moment after your oldest backup", req.At.UTC().Format("2006-01-02 15:04:05"))
 	}
-	if anchor.Equal(req.At.UTC()) {
+	if reconstruct.SnapshotDirName(anchor) == reconstruct.SnapshotDirName(req.At) {
+		// Compared by the DIRECTORY NAME, which is what collides, not by the
+		// instant: the name is whole seconds, and the console truncates At on
+		// the way in, but a caller that did not would fold a 10:00:00.5
+		// restore onto the 10:00:00 snapshot's directory.
 		// The handler refuses a COMPLETE local snapshot at exactly this
 		// instant before the job starts; this is the same refusal for the
 		// bucket, which the handler does not open. Without it the fold would

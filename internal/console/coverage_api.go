@@ -74,7 +74,11 @@ type coverageResponse struct {
 	// when the server has an S3 destination (the same rule the scheduled
 	// update follows, BaselineFoldSource, #1541), "dir" when it has only a
 	// local directory, "" when Restore refuses the server outright — no
-	// local directory of its own to fold INTO, whatever it reads from.
+	// local directory of its own to fold INTO, whatever it reads from — and
+	// "inherited" when the server names no location of its own and the card
+	// graded the daemon-wide ones its bundle resolved to: a backup is there
+	// and time-travel reads it, but Restore refuses that server too (#1602),
+	// so the window is real and the button is not.
 	// Time-travel reads the other way round (local first, bucket on a miss,
 	// #766), which is why this card says which location it graded against.
 	RestoreReads string `json:"restore_reads,omitempty"`
@@ -414,10 +418,17 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 		// and grading them as reading nothing would render the "no usable
 		// baseline exists yet" shape over a backup that is there.
 		reads := restoreReadsFrom(bundleBaselineDir(b), bundleBaselineS3(b))
+		// Reported as "inherited" rather than the kind: the window is graded
+		// from a location the server did not name, and Restore refuses it
+		// either way. Stays "" when even the inherited locations give the fold
+		// nowhere to write, which is the restore_needs_local shape.
+		if reads != "" {
+			resp.RestoreReads = "inherited"
+		}
 		if e, ok := s.selectedEntry(r); ok && (e.BaselineDir != "" || e.BaselineS3 != "") {
 			reads = restoreReadsFrom(e.BaselineDir, e.BaselineS3)
+			resp.RestoreReads = reads
 		}
-		resp.RestoreReads = reads
 
 		merged := listBaselinesMerged(r.Context(), baselineSourcesOf(b), reconstruct.ListBaselines)
 		// ANY location that FAILED TO LIST makes the verdict unknown, not just
