@@ -4113,7 +4113,9 @@ try {
               // compact block, and what moved there by design is.
               hiddenAlarm: fine.includes("no server can be refreshed"),
               hiddenDormant: fine.includes("Nothing uses this yet"),
-              hiddenSkip: fine.includes("keep backups only in S3"),
+              // The COUNTED sentence, so the compact block's own "keeps
+              // backups only in S3" wording cannot false-positive.
+              hiddenSkip: fine.includes(skipped + " server(s) keep backups only in S3"),
               compactSaving: fine.includes("only when the last backup is read from this machine"),
               compactChose: fine.includes("You chose this here"),
               on, enabled, scheduled, source, targets, skipped,

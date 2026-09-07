@@ -248,7 +248,10 @@ func visibleChars(body string) int {
 	total := 0
 	for _, re := range []*regexp.Regexp{
 		regexp.MustCompile(`text:\s*((?:"(?:[^"\\]|\\.)*"|[^,}\n])*)`),
-		regexp.MustCompile(`say\(([^;]*)\);`),
+		// Quoted strings first, so a ";" inside a sentence does not end the
+		// call early and weigh it at zero; newlines allowed, so a ternary
+		// split over lines weighs both arms.
+		regexp.MustCompile(`say\(((?:"(?:[^"\\]|\\.)*"|[^;])*)\)`),
 	} {
 		for _, m := range re.FindAllStringSubmatch(visible, -1) {
 			for _, l := range lit.FindAllStringSubmatch(m[1], -1) {
@@ -276,16 +279,17 @@ func TestBackupSettingsStaysCompact(t *testing.T) {
 	}
 	// The budget covers every arm of every conditional at once (the source
 	// cannot tell which render), so it sits above any one rendered state. By
-	// this exact count on both trees: the pre-#1603 refresh card 1071 and the
+	// this exact count on both trees: the pre-#1603 refresh card 1236 and the
 	// rewrite 497 (the drawing's one sentence, the alarm, the dormancy note
 	// and the S3 skip note, all deliberately visible); the daemon card 222
 	// (its hint paragraph) and 106 (title, chip, the refused-value line). The
-	// caps sit ~40% above the rewrite and ~30% below the old card, so a copy
-	// edit breathes but explaining again rings here before the e2e sees it.
-	if n := visibleChars(refresh); n > 700 {
+	// caps sit ~25% and ~40% above the rewrite and well below the old cards,
+	// so a copy edit breathes but one more paragraph rings here before the
+	// e2e sees it.
+	if n := visibleChars(refresh); n > 620 {
 		t.Errorf("backupRefreshCard's visible text is %d characters; the drawing carries the rule, so put the rest behind cnFine", n)
 	}
-	if n := visibleChars(daemon); n > 160 {
+	if n := visibleChars(daemon); n > 150 {
 		t.Errorf("backupDaemonCard's visible text is %d characters beyond its rows; explain in the compact block, not above the rows", n)
 	}
 
@@ -323,11 +327,14 @@ func TestBackupSettingsStaysCompact(t *testing.T) {
 		t.Error("the daemon card is inside the tinted .cards grid again; tinted vs plain is the mark that tells the kinds apart")
 	}
 
-	// No em dash in any string literal these surfaces hold: text: values,
-	// say() arguments, bare text children and aria labels alike. Over the
-	// comment-stripped bodies, so a comment's dash does not ring.
-	for name, body := range map[string]string{"backupRefreshCard": refresh, "backupDaemonCard": daemon, "backupServerRow": row,
-		"buildBackupSettings": jsFunctionBody(t, js, "buildBackupSettings"), "cfShape": jsFunctionBody(t, js, "cfShape"), "blCase": jsFunctionBody(t, js, "blCase")} {
+	// No em dash in any double-quoted literal these surfaces hold: text:
+	// values, say() arguments, bare text children and aria labels alike.
+	// Over the SPAN, not the comment-stripped body: a must-not-contain over
+	// jsFunctionBody fails open, because that helper truncates each line at
+	// its first "//" and a URL literal ("s3://...") hides everything after
+	// it on the line. Comments carrying a dash ring here on purpose.
+	for _, name := range []string{"backupRefreshCard", "backupDaemonCard", "backupServerRow", "buildBackupSettings", "cfShape", "blCase"} {
+		body := jsFunctionSpan(t, js, name)
 		for _, m := range regexp.MustCompile(`"([^"\n]*)"`).FindAllStringSubmatch(body, -1) {
 			if strings.Contains(m[1], "—") {
 				t.Errorf("%s holds an em dash in %q", name, m[1])
