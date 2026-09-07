@@ -4536,7 +4536,6 @@ function backupServerRow(srv, readOnly) {
     more.push(p("No scheduled backups. Set one on the Backups page."));
   }
   more.push(docsMore("guides/backup-settings", "per-server", "backup locations per server"));
-  box.append(cnFine("More about this server", ...more));
 
   const msg = el("p", { class: "form-msg err" });
   msg.hidden = true;
@@ -4572,7 +4571,10 @@ function backupServerRow(srv, readOnly) {
     // provenance row depends on the resolution the daemon just recomputed.
     renderRoute();
   };
+  // Save sits right under the fields it saves; the compact block comes
+  // last, as on the disk-space card.
   box.append(el("div", { class: "stg-cardfoot" }, save), msg);
+  box.append(cnFine("More about this server", ...more));
   return box;
 }
 

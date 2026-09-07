@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "bintrail": {
+      "command": "go",
+      "args": ["run", "./cmd/bintrail-mcp"],
+      "env": {
+        "BINTRAIL_INDEX_DSN": ""
+      }
+    }
+  }
+}

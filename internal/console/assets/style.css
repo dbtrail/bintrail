@@ -2927,13 +2927,15 @@ button { font-family: inherit; }
   letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3);
   margin: 22px 0 10px;
 }
-.bks-sect:first-of-type { margin-top: 0; }
+.page-head + .bks-sect { margin-top: 0; }
 .bks-boot { margin-bottom: 18px; }
 .bks-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 /* An empty value renders as the word for what applies, in the muted style: a
-   value, not a gap. A refused value stays the row's fallback but is marked. */
+   value, not a gap. A refused value shows the fallback the daemon fell to,
+   in the fault colour, with the loud line under the row saying why; not
+   struck through, because the fallback is a real value, just not in force. */
 .bks-value.bks-default { color: var(--ink-3); font-weight: 400; }
-.bks-value.bks-refused { color: var(--delete); text-decoration: line-through; }
+.bks-value.bks-refused { color: var(--delete); }
 .bks-more { margin-bottom: 4px; }
 .bks-docs { color: var(--ink-2); text-decoration: underline; text-underline-offset: 2px; }
 .bks-docs:hover { color: var(--accent); }
