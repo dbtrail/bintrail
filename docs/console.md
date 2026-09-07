@@ -210,9 +210,9 @@ and searching events:
    downloadable; its status names the previous build's directory until that
    removal succeeds. The This daemon page shows what is staged while it
    exists, previous builds that could not be removed included.
-8. **Settings** — **Backups & snapshots** (every parameter that shapes a
+8. **Settings** — **Backup settings** (every parameter that shapes a
    backup or a snapshot, with its provenance — see
-   [The Backups & snapshots settings page](#the-backups--snapshots-settings-page);
+   [The Backup settings page](#the-backup-settings-page);
    on `serve` only the editable per-server half renders, since this page is
    the one editor of a server's backup location), and under `watch` only:
    **Retention** (rotation policy and
@@ -511,7 +511,7 @@ The Backups summary card that used to point here from Storage is gone (#1543):
 Backups has its own entry in the same sidebar, and the pointer only existed
 because the page it pointed away from was a drawer.
 
-### The Backups & snapshots settings page
+### The Backup settings page
 
 One page owns every parameter that shapes a backup or a snapshot (#1582),
 because no two of them were configured the same way: some are daemon flags,
@@ -521,25 +521,37 @@ real and invisible. A server backed by the daemon's `--baseline-dir` showed
 an empty Backup dir field, indistinguishable from a server with no backup
 location at all.
 
-- **This daemon** — the nine daemon-wide values (`--baseline-dir`,
+The page shows the three kinds of setting instead of describing them (#1603).
+Two section labels split it: **Change here** and **Set when dbtrail starts**.
+
+- **Backups & disk space** (change here) — the carry-forward toggle, moved
+  here from the Backups page; it applies live. What it does is drawn: two
+  backups of five tables, the unchanged ones carried across as dashed tiles
+  and the changed ones written again, with one sentence beside it. The
+  local-only rule, the S3 skip count and whose choice the value was sit in a
+  compact **More about disk space** block, with links into the docs guide.
+- **Per server** (change here) — each registry server's Backup dir, Backup
+  S3 and archive toggle, editable in place, with which location is in force
+  drawn rather than said: a three-row legend (own location, daemon default,
+  no location) with a tick or a cross per lane, and the server's own case
+  highlighted under its fields. The daemon default backs time-travel,
+  verification and `.sql` exports but backups, restores and the schedule
+  refuse, which is the cross on the middle row. The per-server fields left
+  the server edit form for this page (the form still round-trips them, so an
+  unrelated edit cannot wipe them). A stored schedule that cannot run as
+  things stand shows the refusal above the compact block; the schedule
+  itself and the full-backup note sit inside it. Save wakes up when a field
+  differs from what was loaded.
+- **Set at startup** — the nine daemon-wide values (`--baseline-dir`,
   `--baseline-s3`, `--baseline-retain`, `--baseline-refresh-interval`,
   `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE`, `BINTRAIL_CONSOLE_BASELINE_TRIGGER`,
   `BINTRAIL_CONSOLE_BASELINE_STAGING`, `--verify-interval`,
   `--verify-tables`), each shown verbatim with the exact flag or variable
-  name and a "restart to change" chip on the row. Read-only on purpose: the
-  console never edits the process's command line or environment.
-- **Backups & disk space** — the carry-forward toggle, moved here from the
-  Backups page; it applies live, which is why it is a card with buttons and
-  not a chipped row.
-- **Per server** — each registry server's Backup dir, Backup S3 and archive
-  toggle, editable in place, with a provenance line: its own location, the
-  daemon default it falls back to, or nothing. The per-server fields left the
-  server edit form for this page (the form still round-trips them, so an
-  unrelated edit cannot wipe them). A server whose scheduled backups can only
-  run as full reads (an S3 prefix and no local folder — folding writes files)
-  says so on its row, and a stored schedule that cannot run at all (say, its
-  backup location was cleared after the schedule was saved) shows the refusal
-  instead of the promise.
+  name, on a plain card with one **Restart to change** chip. An empty value
+  reads as the word for what applies (`none`, `off`, `all tables`, `temp
+  folder`), never as a fault. Read-only on purpose: the console never edits
+  the process's command line or environment. A value the daemon refused
+  (today: an invalid lock mode) stays loud under its row.
 
 The per-server half is the whole page on the standalone `serve` console: the
 daemon cards describe loops only `watch` runs, but the backup location is
@@ -568,7 +580,7 @@ Storage, which had become a drawer: seven cards from five unrelated concerns
 
 Two cards left the page entirely. **Backups & disk space** moved to the
 Backups page beside **Scheduled backups** (#1543), and from there to the
-**Backups & snapshots** settings page (#1582), which owns settings the way
+**Backup settings** page (#1582), which owns settings the way
 the Backups page owns the work — schedules, runs and downloads stay beside
 the data they report on.
 **Download a DuckDB schema** moved to the SQL page, from there to

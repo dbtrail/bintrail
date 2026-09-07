@@ -4223,43 +4223,112 @@ try {
     ? ok("telemetry: the shown bytes are the daemon's sample_event verbatim")
     : bad("telemetry: the shown bytes are the daemon's sample_event verbatim", JSON.stringify({ shown: telSample.shown, fromApi: telSample.fromApi }));
 
-  // ── Scenario 17i — the Backups & snapshots settings page (#1582) ──
-  // The page's job is provenance. Driven LIVE against the watch daemon: nine
-  // daemon rows, each carrying the exact flag or variable name and a restart
-  // chip on the control (the split between applies-now and needs-restart,
-  // said on the row rather than in prose), plus the carry-forward card that
-  // moved here from the Backups page — one surface at a time, so the old
-  // page must no longer mount it.
+  // ── Scenario 17i — the Backup settings page (#1582, #1603) ──
+  // The page's job is provenance, and since #1603 it SHOWS the three kinds
+  // of setting instead of describing them: the disk-space switch and the
+  // per-server rows under "Change here", the daemon's own values under "Set
+  // when dbtrail starts" on a plain card with ONE restart chip, and two
+  // drawings where paragraphs used to be. Driven LIVE against the watch
+  // daemon. Guards, in the order the issue ranked them:
+  //   1. the name: nav item and page head both read Backup settings;
+  //   2. the kinds: two section labels, one card-level chip and zero per-row
+  //      chips, no "not set" anywhere (an empty value renders as the word
+  //      for what applies);
+  //   3. the budget and the drawings: visible text under a cap with the
+  //      fine print compact (closed <details>), the switch drawn as tiles,
+  //      and the location drawing held against the API: every server has
+  //      exactly one current case, stamped with the source the API returned.
+  // innerText is the budget's measuring stick, as on Connect: a closed
+  // <details> contributes only its summary line. The per-server panel is
+  // EXCLUDED from the count because it scales with the registry (this run
+  // seeds several servers), which would make the cap measure the fixture.
+  // The cap (1300) sits ~45% above the rewritten page (906 measured here,
+  // with the harness's daemon flags; the nine rows' labels and flag names
+  // are most of it) and ~25% below the pre-#1603 page (1719 measured by the
+  // same method with zero compact blocks, RED verified), so a copy edit
+  // breathes but a wall of text rings.
   await page.evaluate(() => navigate("backup-settings"));
   // Options are the THIRD waitForFunction parameter; an options object in
   // the arg slot is serialized to the predicate and silently discarded
   // (#1589), leaving the 30s default in force. Stated as 30s explicitly.
   await page.waitForFunction(() => location.pathname === "/backup-settings"
     && document.querySelectorAll(".bks-row").length >= 5, undefined, { timeout: 30000 });
+  const bksAPI = await page.evaluate(() => api("/api/backup-settings"));
   const bks = await page.evaluate(() => {
-    const rows = Array.from(document.querySelectorAll(".bks-row")).map((r) => ({
-      chip: (r.querySelector(".bks-restart") || {}).textContent || "",
+    const view = document.querySelector(".view");
+    const rows = Array.from(view.querySelectorAll(".bks-row")).map((r) => ({
+      chips: r.querySelectorAll(".bks-restart").length,
       cli: (r.querySelector(".bks-cli") || {}).textContent || "",
       value: (r.querySelector(".bks-value") || {}).textContent || "",
     }));
+    const boot = view.querySelector(".card.bks-boot");
+    const perServer = view.querySelector(".ov-panel");
+    const fine = Array.from(view.querySelectorAll("details.cn-fine"));
+    const visible = view.innerText;
     return {
+      head: (view.querySelector(".page-title") || {}).textContent || "",
+      nav: (document.querySelector('.nav-item[data-route="backup-settings"] span:last-child') || {}).textContent || "",
+      docsLink: !!view.querySelector(".page-docs"),
       rows: rows.length,
-      allChipped: rows.every((r) => r.chip === "restart to change"),
+      rowChips: rows.reduce((n, r) => n + r.chips, 0),
+      cardChips: boot ? boot.querySelectorAll(".card-title .bks-restart").length : -1,
+      bootInGrid: !!view.querySelector(".cards .bks-boot"),
+      sections: Array.from(view.querySelectorAll(".bks-sect")).map((n) => n.textContent),
       allNamed: rows.every((r) => /^\(CLI: (--|BINTRAIL_)/.test(r.cli)),
-      // "not set" is the card's own fallback, so every row always has SOME
-      // text; the discriminating assertion is that the values the harness
-      // configured came through. run.sh starts watch with --baseline-dir,
-      // so the first row must carry a real path, not the fallback.
+      // run.sh starts watch with --baseline-dir, so the first row must carry
+      // a real path, not the word for an empty value.
       configuredValued: rows.length > 0 && rows[0].value.startsWith("/"),
-      refreshCardHere: !!document.querySelector(".view .bkr-head"),
+      notSet: /not set/i.test(visible),
+      emDash: /—/.test(visible),
+      visibleChars: visible.length - (perServer ? perServer.innerText.length : 0),
+      fine: fine.length,
+      fineOpen: fine.filter((d) => d.open).length,
+      refreshCardHere: !!view.querySelector(".bkr-head"),
+      cfTiles: view.querySelectorAll(".bkr-head ~ .cf-shape .cf-row").length,
+      legend: Array.from(view.querySelectorAll(".bl-legend .bl-case")).map((c) => c.dataset.source),
+      current: Array.from(view.querySelectorAll(".bks-server")).map((b) => ({
+        name: (b.querySelector(".bks-server-name") || {}).textContent || "",
+        cases: Array.from(b.querySelectorAll(".bl-case.is-current")).map((c) => c.dataset.source),
+      })),
+      moreLinks: Array.from(view.querySelectorAll("details.cn-fine a.bks-docs")).map((a) => a.href),
     };
   });
-  (bks.rows === 9 && bks.allChipped && bks.allNamed && bks.configuredValued)
-    ? ok("backup-settings: nine daemon rows, each named and chipped, the configured one valued")
-    : bad("backup-settings: nine daemon rows, each named and chipped, the configured one valued", JSON.stringify(bks));
-  (bks.refreshCardHere)
-    ? ok("backup-settings: the carry-forward card moved here")
-    : bad("backup-settings: the carry-forward card moved here", "no .bkr-head on /backup-settings");
+  // The measurement itself, so a cap can be re-derived from a run's log.
+  console.log("backup-settings: measured " + JSON.stringify({ visibleChars: bks.visibleChars, fine: bks.fine }));
+  (bks.head === "Backup settings" && bks.nav === "Backup settings" && bks.docsLink)
+    ? ok("backup-settings: named Backup settings in the nav and the head, with a Docs link")
+    : bad("backup-settings: named Backup settings in the nav and the head, with a Docs link", JSON.stringify({ head: bks.head, nav: bks.nav, docsLink: bks.docsLink }));
+  (bks.rows === 9 && bks.allNamed && bks.configuredValued && !bks.notSet)
+    ? ok("backup-settings: nine daemon rows, each named, the configured one valued, none reading not set")
+    : bad("backup-settings: nine daemon rows, each named, the configured one valued, none reading not set", JSON.stringify(bks));
+  (bks.cardChips === 1 && bks.rowChips === 0 && !bks.bootInGrid && bks.sections.length === 2)
+    ? ok("backup-settings: the three kinds are drawn apart: two sections, one card-level restart chip, the daemon card outside the tinted grid")
+    : bad("backup-settings: the three kinds are drawn apart: two sections, one card-level restart chip, the daemon card outside the tinted grid",
+        JSON.stringify({ cardChips: bks.cardChips, rowChips: bks.rowChips, bootInGrid: bks.bootInGrid, sections: bks.sections }));
+  (bks.visibleChars > 0 && bks.visibleChars < 1300 && bks.fine >= 2 && bks.fineOpen === 0 && !bks.emDash)
+    ? ok("backup-settings: visible text stays under budget with the fine print compact")
+    : bad("backup-settings: visible text stays under budget with the fine print compact",
+        JSON.stringify({ chars: bks.visibleChars, fine: bks.fine, open: bks.fineOpen, emDash: bks.emDash }));
+  (bks.refreshCardHere && bks.cfTiles === 2)
+    ? ok("backup-settings: the carry-forward card moved here and draws two backups")
+    : bad("backup-settings: the carry-forward card moved here and draws two backups", JSON.stringify({ here: bks.refreshCardHere, rows: bks.cfTiles }));
+  // The drawing cannot lie: the legend draws exactly the verdict set the
+  // API can return, and each seeded server's current case is the source the
+  // API returned for it. Held against the API response, not a list typed
+  // here; the Go side pins the same set to the constants in the handler.
+  const apiSources = (bksAPI.servers || []).map((s) => ({ name: s.name || s.id, source: s.source }));
+  const legendSet = bks.legend.slice().sort().join(",");
+  const apiSet = Array.from(new Set(apiSources.map((s) => s.source))).sort();
+  const legendCoversAPI = apiSet.every((s) => bks.legend.includes(s));
+  const currentMatches = apiSources.length > 0 && apiSources.length === bks.current.length
+    && apiSources.every((s, i) => bks.current[i].name === s.name && bks.current[i].cases.length === 1 && bks.current[i].cases[0] === s.source);
+  (legendSet === "default,none,server" && legendCoversAPI && currentMatches)
+    ? ok("backup-settings: the location drawing shows the three cases and marks each server's own as the API reports it")
+    : bad("backup-settings: the location drawing shows the three cases and marks each server's own as the API reports it",
+        JSON.stringify({ legend: bks.legend, api: apiSources, current: bks.current }));
+  (bks.moreLinks.length >= 3 && bks.moreLinks.every((h) => h.startsWith("https://www.dbtrail.com/docs/guides/")))
+    ? ok("backup-settings: the compact blocks link into the docs guides")
+    : bad("backup-settings: the compact blocks link into the docs guides", JSON.stringify(bks.moreLinks));
   // Settled on the LISTING panel, not a timer: the whole page builds in one
   // pass, so once the panel title is up, a mounted card would be too — a
   // sleep could pass this vacuously against a half-rendered page.

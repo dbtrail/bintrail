@@ -320,7 +320,7 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 		return nil
 	}
 	if rebuildErr := rebuildPossible(e); rebuildErr != nil {
-		return notRunnable(strings.TrimSuffix(fullErr.Error(), " (Backups & snapshots page)") + "; " + rebuildErr.Error() + " (Backups & snapshots page)")
+		return notRunnable(strings.TrimSuffix(fullErr.Error(), " (Backup settings page)") + "; " + rebuildErr.Error() + " (Backup settings page)")
 	}
 	// Only a rebuild is possible. That is a runnable schedule (it is what
 	// --baseline-refresh-interval does), but only once there is a backup to

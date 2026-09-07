@@ -83,7 +83,7 @@ const ROUTES = ["overview", "events", "schema-changes", "timetravel", "recover",
   // practice — it pushed verification, the panel that answers "are my backups
   // restorable", roughly two screens below the fold.
   "baselines", "verification",
-  // The Backups & snapshots settings page (#1582): every parameter that
+  // The Backup settings page (#1582): every parameter that
   // shapes a backup or a snapshot, with its provenance.
   "backup-settings"];
 
@@ -106,6 +106,7 @@ const DOCS_PAGES = {
   verification: "guides/verify",
   storage: "guides/capacity-planning",
   connect: "claude/setup",
+  "backup-settings": "guides/backup-settings",
 };
 
 const MON_STATE_TITLES = {
@@ -4121,6 +4122,48 @@ function rotationCard(rot) {
 // The consequence of a reused file (two backups sharing the same bytes on
 // disk, where the filesystem allows it) is a thing a reader wants while
 // reading docs, not while flipping the switch: docs/console.md carries it.
+// cfShape draws what the disk-space switch does (#1603): two backups, one
+// above the other, five tables each. With the switch on, a table that did not
+// change keeps the file the last backup wrote (dashed: the same file, carried
+// across) and only the changed ones are written again (solid). With it off,
+// every tile in the second row is written again. Both rows always hold five
+// tiles: completeness is shown, not promised. Built with el(), not svgEl
+// (static constants only, see app.js:26). No transitions, so reduced motion
+// needs nothing here.
+function cfShape(on) {
+  const tile = (cls) => el("span", { class: "cf-tile" + (cls ? " " + cls : ""), "aria-hidden": "true" });
+  const row = (cap, classes) => {
+    const r = el("div", { class: "cf-row" });
+    for (const c of classes) r.append(tile(c));
+    return el("div", { class: "cf-part" }, r, el("div", { class: "dk-cap", text: cap }));
+  };
+  // Three of five carried: enough kept tiles to read as the rule, enough
+  // rewritten ones to read as "still a backup".
+  const next = on ? ["cf-kept", "cf-kept", "cf-new", "cf-kept", "cf-new"] : ["cf-new", "cf-new", "cf-new", "cf-new", "cf-new"];
+  const shape = el("div", { class: "cf-shape" + (on ? "" : " cf-off"), role: "img",
+    "aria-label": on
+      ? "Two backups. In the newer one, tables with no changes keep the file from the last backup and only changed tables are written again. Every table is present."
+      : "Two backups. In the newer one every table is written again, changed or not." },
+    row("last backup", ["", "", "", "", ""]),
+    row("this backup", next));
+  const key = el("div", { class: "cf-key", "aria-hidden": "true" });
+  if (on) key.append(el("span", { class: "cf-tile cf-kept" }), el("span", { text: "kept" }));
+  key.append(el("span", { class: "cf-tile cf-new" }), el("span", { text: "written" }));
+  shape.append(key);
+  return shape;
+}
+
+// docsMore is one plain link into the docs site for a compact block: the
+// page under DOCS_BASE, optionally a section on it. Inert offline, like the
+// header Docs link (air-gapped consoles are a first-class deployment).
+// assets_docs_links_test.go requires every slug used here to be a page the
+// header table already carries, so the network check covers it.
+function docsMore(slug, section, label) {
+  return el("p", { class: "form-hint bks-more" },
+    el("a", { class: "bks-docs", href: DOCS_BASE + slug + "/" + (section ? "#" + section : ""),
+      target: "_blank", rel: "noopener", text: "Read more: " + label }));
+}
+
 function backupRefreshCard(br) {
   const card = el("div", { class: "card" });
   const head = el("div", { class: "card-title bkr-head" },
@@ -4135,59 +4178,35 @@ function backupRefreshCard(br) {
   // why the card was opened. It rides the title rather than a row so nothing
   // sits between the reader and it.
   head.append(el("span", { class: "tag-pill bkr-state", text: on ? "On" : "Off" }));
-  const say = (t) => card.append(el("p", { class: "form-hint", text: t }));
-  // Off leads with what is happening now and then makes the offer, because the
-  // question a reader asks at an off switch is what he gets by turning it on.
-  // Both arms promise completeness in the same breath as the saving: "keeps
-  // the old file" reads as a partial backup otherwise, and that is the one
-  // thing a recovery tool must never let a reader believe.
-  if (on) {
-    say("A table with no changes keeps its file from the last backup instead of being written again. The backup is still complete.");
-  } else {
-    say("Every backup writes every table again, even the ones that did not change.");
-    say("Turn this on and a table with no changes keeps its file from the last backup instead. The backup is still complete.");
-  }
-  say("It saves disk only when the last backup is read from this machine. A scheduled backup on a server that has a Backup S3 reuses nothing, so it writes every table.");
-  // "covers every server" was false for an S3-only server, which the refresh
-  // timer skips permanently (#1579); scoped to the servers the loop can
-  // actually reach, with the skip counted right below it.
-  say("This one setting covers every server that keeps backups on this machine.");
+  // say() writes into the card until the compact block opens below, then
+  // into the block: same sentences, one click further away.
+  let into = card;
+  const say = (t) => into.append(el("p", { class: "form-hint", text: t }));
+  // The drawing carries the rule (#1603); one sentence rides under it. Both
+  // arms promise completeness in the same breath as the saving: "keeps the
+  // old file" reads as a partial backup otherwise, and that is the one thing
+  // a recovery tool must never let a reader believe.
+  card.append(cfShape(on));
+  say(on
+    ? "Tables with no changes keep their last file. The backup is still complete."
+    : "Every backup writes every table again.");
   // The everything-running silence #1579 names: enabled and scheduled both
   // true reads as the healthy state, while the timer can be running over
   // ZERO refreshable servers (fresh install, or every server S3-only or
   // without a Backup dir). br.targets is computed live by the daemon and
   // omitted where no loop runs, so the alarm can only fire on a watch
-  // daemon whose loop truly covers nothing.
+  // daemon whose loop truly covers nothing. Never compact: it is a fault.
   if (br.scheduled && br.targets === 0) {
     card.append(el("p", { class: "form-msg err", text:
-      "The refresh timer is on, but no server can be refreshed: a refresh needs an index connection " +
-      "and a local Backup dir. Nothing will refresh until a server has both; set one in the servers list below." }));
+      "The refresh timer is on, but no server can be refreshed. A refresh needs an index connection " +
+      "and a local Backup dir; set one in the servers list below." }));
   }
-  // What the skipped servers CANNOT do, not what they will do: an update from
-  // the recorded changes writes Parquet to a local directory, which is the very
-  // field these servers lack, so the bucket is never read back into a cheaper
-  // backup. The positive form ("their backups are full backups") would be a
-  // PREDICTION, and this card holds no gate data: with the create-backup
-  // opt-in off, a schedule on such a server is refused and takes no backup at
-  // all. The per-server rows below make that prediction, and only after
-  // checking the refusal.
-  if (br.skipped_s3_only > 0) {
-    say(br.skipped_s3_only + " server(s) keep backups only in S3, so the timer skips them. Those servers never get an update from the recorded changes; the only backup they can get is a full one.");
-  }
-  // Three situations, not two. A daemon started with the backup trigger and no
-  // refresh schedule still applies this to restores, so calling it dormant
-  // there would let an operator reuse files right after being told nothing
-  // runs. The dormant arm names a restart because liveness is decided at boot:
-  // with no consumer there is no restore path either, so waiting changes
-  // nothing.
+  // A saved switch that nothing uses must say so where it is read, so it
+  // stays outside the compact block. Liveness is decided at boot: with no
+  // consumer there is no restore path either, so waiting changes nothing.
   if (!br.enabled) {
-    say("Nothing uses this yet. Your choice is saved, and it starts working the next time dbtrail runs with backups or restores turned on.");
-  } else if (!br.scheduled) {
-    say("Restores use this, and so do any backup schedules you set above. Nothing refreshes all servers on one timer.");
+    say("Nothing uses this yet. It starts working the next time dbtrail runs with backups or restores turned on.");
   }
-  say(br.source === "override"
-    ? "You chose this here. It replaces the setting dbtrail started with."
-    : "This is the setting dbtrail started with.");
   const foot = el("div", { class: "stg-cardfoot" },
     el("button", {
       class: "btn btn-sm", type: "button",
@@ -4207,6 +4226,32 @@ function backupRefreshCard(br) {
     }));
   }
   card.append(foot);
+  // Everything a reader does not need in order to act is compact, not cut:
+  // the local-only rule, the S3 skip count (#1579), what consumes the
+  // setting, and whose choice the current value was.
+  const more = cnFine("More about disk space");
+  into = more;
+  say("It saves disk only when the last backup is read from this machine. A server that keeps backups only in S3 reuses nothing, so every backup writes every table.");
+  // What the skipped servers CANNOT do, not what they will do: an update from
+  // the recorded changes writes Parquet to a local directory, which is the very
+  // field these servers lack, so the bucket is never read back into a cheaper
+  // backup. The positive form would be a PREDICTION this card has no gate
+  // data for; the per-server rows make it, after checking the refusal.
+  if (br.skipped_s3_only > 0) {
+    say(br.skipped_s3_only + " server(s) keep backups only in S3, so the timer skips them. The only backup they can get is a full one.");
+  }
+  // A daemon started with the backup trigger and no refresh schedule still
+  // applies this to restores, so it is not dormant there.
+  if (br.enabled && !br.scheduled) {
+    say("Restores use this, and so do the backup schedules you set. Nothing refreshes all servers on one timer.");
+  }
+  say("This one setting covers every server that keeps backups on this machine.");
+  say(br.source === "override"
+    ? "You chose this here. It replaces the setting dbtrail started with."
+    : "This is the setting dbtrail started with.");
+  more.append(docsMore("guides/backup-settings", "backups--disk-space", "the disk-space switch"),
+    docsMore("guides/backup-strategy", "", "how dbtrail backs up your database"));
+  card.append(more);
   return card;
 }
 
@@ -4245,15 +4290,23 @@ async function saveBackupRefresh(body) {
   renderRoute();
 }
 
-// ── Backups & snapshots settings (#1582) ────────────────────────────────────
+// ── Backup settings (#1582, #1603) ──────────────────────────────────────────
 //
 // The one page that owns backup and snapshot parameters. Its job is
 // PROVENANCE: the precedence (per server, then daemon flag, then nothing) is
 // real and used to be invisible — a server backed by the daemon's backup
 // folder showed an empty field, indistinguishable from a server with no
-// backup location at all. Daemon-wide values render read-only with the exact
-// name to change and a restart chip ON the row, never as a prose paragraph;
-// per-server values edit in place.
+// backup location at all.
+//
+// Three kinds of setting live here, and the LAYOUT tells them apart (#1603),
+// not a sentence: the disk-space switch and the per-server rows change on
+// this page and apply at once; the daemon's own values were set when the
+// process started and change on restart. The first two sit under one
+// section label, the third under its own, on a plain card outside the
+// tinted grid with ONE restart chip at card level. Prose a reader does not
+// need in order to act is compact by default (cnFine), never cut, and the
+// two rules that used to be paragraphs are drawn: cfShape for the switch,
+// blCase for which backup location is in force.
 
 async function renderBackupSettings() {
   const gen = serverGen, vgen = viewGen;
@@ -4269,80 +4322,145 @@ async function renderBackupSettings() {
   try {
     buildBackupSettings(settings, refresh);
   } catch (err) {
-    const v = VIEW(); clear(v); v.append(pageHead("Backups & snapshots", null)); renderError(v, err);
+    const v = VIEW(); clear(v); v.append(pageHead("Backup settings", null)); renderError(v, err);
   }
 }
 
 function buildBackupSettings(settings, refresh) {
   const v = VIEW(); clear(v);
-  v.append(pageHead("Backups & snapshots", el("p", { class: "page-sub" },
-    "Every setting that shapes a backup or a snapshot, and where each value comes from.")));
+  v.append(pageHead("Backup settings", el("p", { class: "page-sub", text: capsCache.monitor
+    ? "Where backups go, and what this dbtrail was started with."
+    : "Where each server keeps its backups." })));
   const broken = settings && settings.error;
   if (broken) v.append(el("div", { class: "error-box", text: "Could not load settings: " + settings.error }));
+  const sect = (t) => el("div", { class: "bks-sect", text: t });
   // The daemon-side cards are monitor-gated, not the page: serve runs no
   // refresh loop and its daemon rows would render as an unconfigured
-  // install. The per-server panel below is the page's serve-reachable half —
-  // the only editor of the registry's backup fields.
+  // install. The per-server panel is the page's serve-reachable half — the
+  // only editor of the registry's backup fields. The section labels exist
+  // only where there are two kinds to tell apart.
   if (capsCache.monitor) {
-    const cards = el("div", { class: "cards" });
+    v.append(sect("Change here"));
     // The carry-forward card moved here from the Backups page: it is a setting,
     // and this page is where settings live; the Backups page keeps the work
     // (schedules, runs, downloads) beside the data it reports on.
-    cards.append(backupRefreshCard(refresh));
-    if (!broken) cards.append(backupDaemonCard(settings.daemon || []));
-    v.append(cards);
+    v.append(el("div", { class: "cards" }, backupRefreshCard(refresh)));
   }
   if (!broken) v.append(backupServersPanel(settings));
+  if (capsCache.monitor && !broken) {
+    v.append(sect("Set when dbtrail starts"));
+    v.append(backupDaemonCard(settings.daemon || []));
+  }
   viewEnter();
 }
 
 // What each daemon-wide key means, in words a reader who never saw the flag
 // can act on. The flag itself rides beside the value in the (CLI: ...) form.
+// Vocabulary matches the per-server fields and the Backups page: Backup dir,
+// Backup S3, refresh.
 const BACKUP_DAEMON_ROWS = {
-  baseline_dir: "Backup folder for servers without their own",
-  baseline_s3: "Backup S3 for servers without their own",
+  baseline_dir: "Default Backup dir",
+  baseline_s3: "Default Backup S3",
   baseline_retain: "Delete local snapshots older than",
-  refresh_every: "Rebuild the newest backup every",
-  lock_mode: "How a dump holds the database still",
+  refresh_every: "Refresh backups every",
+  lock_mode: "Lock while dumping",
   trigger: "Create-backup button",
-  staging_dir: "Staging folder for .sql builds",
+  staging_dir: ".sql build folder",
   verify_interval: "Verify every",
   verify_tables: "Verify only these tables",
 };
 
-// backupDaemonCard renders the values this process was started with. All of
-// them need a restart to change, and each row says so itself — a chip on the
-// control, not a sentence above it — beside the exact flag or variable name.
+// What an EMPTY daemon value means, per key (#1603). One word for all nine
+// would lie: an empty Backup dir is no shared location at all, an empty
+// interval is a loop that never runs, an empty table filter is every table.
+// The word renders as a value in the muted style; "not set" read as a fault
+// on nine rows of a healthy install. lock_mode is never empty on the wire
+// (the daemon resolves its default before reporting) and trigger is a
+// boolean; both carry an entry so the table stays one-to-one with the rows.
+const BACKUP_DAEMON_EMPTY = {
+  baseline_dir: "none",
+  baseline_s3: "none",
+  baseline_retain: "off",
+  refresh_every: "off",
+  lock_mode: "built-in",
+  trigger: "Off",
+  staging_dir: "temp folder",
+  verify_interval: "off",
+  verify_tables: "all tables",
+};
+
+// backupDaemonCard renders the values this process was started with, on a
+// plain card outside the tinted grid: tinted is "change here", plain is
+// "set at startup". One restart chip for the card, not one per row (#1603):
+// nine identical chips read as nine warnings to say one thing. The card chip
+// is only honest while EVERY row needs a restart, so a live-appliable row
+// joining the wire shape drops it and the rows say it for themselves again.
 function backupDaemonCard(rows) {
-  const card = el("div", { class: "card" });
-  card.append(el("div", { class: "card-title", text: "This daemon" }));
-  card.append(el("p", { class: "stg-hint", text:
-    "What this process was started with. These change on the command line or in the environment, and take effect when it restarts." }));
+  const card = el("div", { class: "card bks-boot" });
+  const head = el("div", { class: "card-title bks-head" }, el("span", { text: "Set at startup" }));
+  const allRestart = rows.length > 0 && rows.every((r) => r.needs_restart);
+  if (allRestart) head.append(el("span", { class: "tag-pill bks-restart", text: "Restart to change" }));
+  card.append(head);
   for (const row of rows) {
     const label = BACKUP_DAEMON_ROWS[row.key] || row.key;
     let value = row.value;
     if (row.on != null) value = row.on ? "On" : "Off";
+    const empty = !value;
+    if (empty) value = BACKUP_DAEMON_EMPTY[row.key] || "none";
     const r = el("div", { class: "bks-row" },
       el("span", { class: "bks-label", text: label }),
-      el("span", { class: "bks-value" + (value ? "" : " muted"), text: value || "not set" }));
-    // The restart split lives ON the control, not in prose: a chip per row.
-    if (row.needs_restart) r.append(el("span", { class: "tag-pill bks-restart", text: "restart to change" }));
+      el("span", { class: "bks-value" + (empty ? " bks-default" : "") + (row.err ? " bks-refused" : ""), text: value }));
+    if (!allRestart && row.needs_restart) r.append(el("span", { class: "tag-pill bks-restart", text: "restart to change" }));
     r.append(el("span", { class: "bks-cli", text: "(CLI: " + row.cli + ")" }));
     card.append(r);
     // A rejected value outranks the fallback the row shows: rendering only
     // the default on the one row whose real state is "your value was
-    // refused" is the opposite of provenance. The consequence rides in the
-    // server's err string, so this stays honest for any row that gains one.
+    // refused" is the opposite of provenance. Loud, under its row, never
+    // compact. The consequence rides in the server's err string, so this
+    // stays honest for any row that gains one.
     if (row.err) {
       card.append(el("p", { class: "form-msg err", text:
-        "The configured value was rejected and is not in force: " + row.err }));
+        "The value you set was refused and is not in force: " + row.err }));
     }
   }
+  card.append(cnFine("More about changing these",
+    el("p", { class: "form-hint", text:
+      "These come from the command line or the environment of the dbtrail process. Change the flag or variable shown under the row, then restart dbtrail." }),
+    docsMore("guides/backup-settings", "set-at-startup", "settings that need a restart")));
   return card;
 }
 
+// BACKUP_SOURCE_CASES draws the three answers to "which backup location is
+// in force for this server", keyed by the EXACT Source values
+// backup_settings_api.go emits; assets_backupsettings_test.go pins the two
+// sets against each other, so a fourth verdict on either side rings instead
+// of leaving a picture that still shows three. The daemon default is the
+// case the page exists for: it backs the reads (time-travel, verification,
+// .sql exports) while the writes refuse (backups, restores, the schedule), so
+// it draws as one tick and one cross.
+const BACKUP_SOURCE_CASES = {
+  server: { name: "Own location", reads: true, writes: true },
+  default: { name: "Daemon default", reads: true, writes: false },
+  none: { name: "No location", reads: false, writes: false },
+};
+
+// blCase renders one case row: the name, then a tick or a cross per lane.
+// Marks are characters, not colour alone. `current` marks the row that is
+// this server's answer; the legend renders all three unmarked.
+function blCase(source, current) {
+  const c = BACKUP_SOURCE_CASES[source] || { name: source, reads: false, writes: false };
+  const lane = (label, ok) => el("span", { class: "bl-lane " + (ok ? "on" : "no") },
+    el("span", { class: "bl-mark", text: ok ? "✓" : "✗" }), label);
+  return el("div", { class: "bl-case" + (current ? " is-current" : ""), "data-source": source,
+    "aria-current": current ? "true" : null },
+    el("span", { class: "bl-name", text: c.name }),
+    lane("time-travel", c.reads),
+    lane("backups and restores", c.writes));
+}
+
 // backupServersPanel is the per-server half: the editable backup location and
-// archive toggle, each with the provenance the servers API never showed.
+// archive toggle, each with the provenance the servers API never showed. The
+// legend draws the three cases once; each server then shows its own.
 function backupServersPanel(settings) {
   const panel = el("section", { class: "ov-panel" });
   panel.append(el("div", { class: "ov-panel-head" },
@@ -4352,6 +4470,9 @@ function backupServersPanel(settings) {
     panel.append(el("p", { class: "form-hint", text: "No servers in the registry yet. Add one on the Servers page." }));
     return panel;
   }
+  const legend = el("div", { class: "bl-legend" });
+  for (const k of Object.keys(BACKUP_SOURCE_CASES)) legend.append(blCase(k, false));
+  panel.append(legend);
   if (settings.registry_read_only) {
     panel.append(el("p", { class: "form-msg err", text:
       "The server registry was written by a newer version and is read-only here; values are shown but cannot be saved." }));
@@ -4376,56 +4497,62 @@ function backupServerRow(srv, readOnly) {
     el("span", { text: "Don't automatically include archived data in queries" })));
 
   // Provenance, the row's reason to exist: which location is actually in
-  // force, and whose choice it was.
+  // force, drawn as the legend row it matches. The daemon default backs the
+  // READ paths only. Create backup, restores and the schedule read the
+  // server's raw entry on purpose (the default is a shared store; folding
+  // this server's index onto another server's snapshots would publish a
+  // backup that belongs to neither, see baseline_trigger.go), so claiming
+  // the default "is in force" here told the operator their backups were
+  // covered when the write paths would refuse. The cross on that row is the
+  // whole page in one glyph; the line under it says what to do.
   const src = srv.source;
-  let where;
-  if (src === "server") {
-    where = "This server names its own backup location.";
-  } else if (src === "default") {
-    // The daemon default backs the READ paths only. Create backup, restores
-    // and the schedule read the server's raw entry on purpose (the default is
-    // a shared store; folding this server's index onto another server's
-    // snapshots would publish a backup that belongs to neither, see
-    // baseline_trigger.go), so claiming the default "is in force" here told
-    // the operator their backups were covered when the write paths would
-    // refuse.
+  box.append(blCase(src, true));
+  if (src === "default") {
     const eff = srv.resolved_dir || srv.resolved_s3;
-    where = "Using the daemon default: " + eff + ". It covers Time-travel, verification and .sql exports; " +
-      "backups, restores and the schedule need a value saved here for this server.";
-  } else {
-    where = "No backup location. Time-travel, restores and scheduled backups have nothing to read or write.";
+    box.append(el("p", { class: "form-hint" },
+      "Time-travel reads ", el("code", { text: eff }), ". To make backups for this server, save a location above."));
   }
-  box.append(el("p", { class: "form-hint", text: where }));
-
+  // The refusal beats the prediction: the schedule reads the RAW entry, so
+  // clearing the dir on this very page leaves a stored schedule that will
+  // refuse every slot. Never compact.
+  if (srv.schedule_refusal) {
+    box.append(el("p", { class: "form-msg err", text:
+      "The schedule cannot run as things stand: " + srv.schedule_refusal }));
+  }
+  const more = [];
+  const p = (t) => el("p", { class: "form-hint", text: t });
   if (srv.schedule_every) {
-    box.append(el("p", { class: "form-hint", text:
-      "Scheduled backups: every " + srv.schedule_every + (srv.schedule_at ? " at " + srv.schedule_at : "") +
-      ". The schedule is managed on the Backups page." }));
-    if (srv.schedule_refusal) {
-      // The refusal beats the prediction: the schedule reads the RAW entry,
-      // so clearing the dir on this very page leaves a stored schedule that
-      // will refuse every slot — saying "every 6h" alone promises runs that
-      // will not happen.
-      box.append(el("p", { class: "form-msg err", text:
-        "The schedule cannot run as things stand: " + srv.schedule_refusal }));
-    } else if (!srv.resolved_dir && srv.resolved_s3) {
+    more.push(p("Scheduled backups: every " + srv.schedule_every + (srv.schedule_at ? " at " + srv.schedule_at : "") +
+      ". The schedule is managed on the Backups page."));
+    if (!srv.schedule_refusal && !srv.resolved_dir && srv.resolved_s3) {
       // The motivating case, said where the setting lives: with no local
       // folder the scheduled run cannot update from the recorded changes, so
       // every run reads the database in full. Derived from the same shape the
       // Backups page's next-run line reports; config-only here, because a
       // settings listing must not dial every server to predict a run.
-      box.append(el("p", { class: "form-hint", text:
-        "As set up, each scheduled run takes a full backup from your database: updating from the recorded changes writes files, which needs a Backup dir." }));
+      more.push(p("As set up, each scheduled run takes a full backup from your database: updating from the recorded changes writes files, which needs a Backup dir."));
     }
   } else {
-    box.append(el("p", { class: "form-hint", text: "No scheduled backups. Set one on the Backups page." }));
+    more.push(p("No scheduled backups. Set one on the Backups page."));
   }
+  more.push(docsMore("guides/backup-settings", "per-server", "backup locations per server"));
+  box.append(cnFine("More about this server", ...more));
 
   const msg = el("p", { class: "form-msg err" });
   msg.hidden = true;
   const save = el("button", { class: "btn btn-sm", type: "button", text: "Save" });
-  save.disabled = !!readOnly;
   if (readOnly) { dir.disabled = s3.disabled = noArch.disabled = true; }
+  // Save wakes up when something differs from what was loaded, so a click
+  // always means a change; Enter in a field saves too.
+  const was = { dir: srv.baseline_dir || "", s3: srv.baseline_s3 || "", noArch: !!srv.no_archive };
+  const dirty = () => dir.value.trim() !== was.dir || s3.value.trim() !== was.s3 || noArch.checked !== was.noArch;
+  const sync = () => { save.disabled = !!readOnly || !dirty(); };
+  for (const input of [dir, s3]) {
+    input.addEventListener("input", sync);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !save.disabled) save.click(); });
+  }
+  noArch.addEventListener("change", sync);
+  sync();
   save.onclick = async () => {
     save.disabled = true;
     msg.hidden = true;
@@ -4437,12 +4564,12 @@ function backupServerRow(srv, readOnly) {
     } catch (err) {
       msg.textContent = (err && err.message) || String(err);
       msg.hidden = false;
-      save.disabled = false;
+      sync();
       return;
     }
     toast("Saved for " + (srv.name || srv.id));
     // Repaint from the server's answer, not from what was clicked: the
-    // provenance line depends on the resolution the daemon just recomputed.
+    // provenance row depends on the resolution the daemon just recomputed.
     renderRoute();
   };
   box.append(el("div", { class: "stg-cardfoot" }, save), msg);
@@ -4810,7 +4937,7 @@ function baselineConfigHint(cur, serversErr) {
   if (cur.kind === "ephemeral") {
     return "Restart the daemon with --baseline-dir or --baseline-s3 (compose: BASELINE_DIR in .env).";
   }
-  return "Set Backup dir or S3 on the Backups & snapshots page.";
+  return "Set Backup dir or S3 on the Backup settings page.";
 }
 
 function formatAge(hours) {
@@ -6486,7 +6613,7 @@ function verifyRegions(servers, opts) {
   control.append(help);
   if (!configured) {
     control.append(el("p", { class: "form-hint", text:
-      "No backup set up for this server yet. The two snapshot modes need one (Backups & snapshots page, then create at least two snapshots). \"Check recovery inputs\" works without one: it only reads the index." }));
+      "No backup set up for this server yet. The two snapshot modes need one (Backup settings page, then create at least two snapshots). \"Check recovery inputs\" works without one: it only reads the index." }));
   }
 
   // ── Region 2: what is running or just ran ──
@@ -8786,7 +8913,7 @@ function cmdkCommands() {
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Backups", run: () => navigate("baselines") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Verification", run: () => navigate("verification") });
-  cmds.push({ group: "Navigate", label: "Backups & snapshots settings", run: () => navigate("backup-settings") });
+  cmds.push({ group: "Navigate", label: "Backup settings", run: () => navigate("backup-settings") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Retention", run: () => navigate("retention") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "This daemon", run: () => navigate("daemon") });
   cmds.push({ group: "Navigate", label: "Access profiles", run: () => navigate("access-profiles") });

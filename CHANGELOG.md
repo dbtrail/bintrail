@@ -28,6 +28,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backed up only on this host, which the daemon-wide refresh interval and a
   failed upload both produce. The Backups page's restore lane offers the
   snapshots the fold reads, and says which location the skipped ones are in.
+### Changed
+- **Console: the Backups & snapshots settings page is now Backup settings, and
+  it shows the three kinds of setting instead of describing them** (#1603).
+  The nav item and the page head both read Backup settings, so the pair with
+  the Backups page reads as work vs configuration (the item already sits
+  inside the sidebar's Settings group, which is why it is not the bare word).
+  The three kinds are told apart by layout: the disk-space switch and the
+  per-server rows sit under "Change here" and apply at once; the daemon's own
+  values sit under "Set when dbtrail starts" on a plain card, retitled Set at
+  startup, with ONE "Restart to change" chip at card level instead of nine
+  identical chips. An empty daemon value renders as the word for what applies
+  (`none`, `off`, `all tables`, `temp folder`), never as `not set`, which read
+  as nine faults on a healthy install.
+  Two rules that used to be paragraphs are drawn: the disk-space switch as two
+  backups of five tables, the unchanged ones carried across as dashed tiles
+  and the changed ones written again; and which backup location is in force,
+  as a three-row legend (own location, daemon default, no location) with the
+  server's own case highlighted and a tick or a cross per lane, so the daemon
+  default's "time-travel reads, backups and restores refuse" is one glyph
+  instead of a sentence. Everything a reader does not need in order to act is
+  compact by default under "More about ..." blocks, not cut, and each block
+  links into the docs guide; the page head carries the Docs link the page
+  never had. Visible text on the daemon-side cards drops from 1719 to about
+  900 characters, and the guards that keep it there: an e2e budget with the
+  fine print compact, a Go test pinning the drawn location cases to the API's
+  own `Source` verdicts in both directions and by count (a fourth verdict on
+  either side fails), and the e2e holding each server's drawn case against
+  the API response. Nothing about what the settings do changes.
 
 ### Added
 - **`doctor` warns about tables with no primary key** (#1608). Those tables are
