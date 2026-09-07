@@ -1174,11 +1174,16 @@ function covCard(c, stamp) {
     if (c.restore_needs_local) {
       card.append(el("p", { class: "cov-line warn", text: "Backups for this server go to S3 only, so \"Restore to a moment\" has nothing local to fold from. Time-travel still reads them. Set this server's backup dir to restore here." }));
     }
-    if (c.offsite_tables && c.offsite_tables.length) {
-      // Warn, not bad: the backup exists and Time-travel reads it from the
-      // bucket. What cannot use it is Restore, which folds from the local
-      // backup folder only.
-      card.append(el("p", { class: "cov-line warn", text: "Backed up only in S3, so \"Restore to a moment\" cannot fold them: " + c.offsite_tables.join(", ") + ". Time-travel still reads them. Take a local backup to restore them here." }));
+    if (c.unreachable_tables && c.unreachable_tables.length) {
+      // Warn, not bad: the backup exists and Time-travel reads it (local
+      // first, bucket on a miss). What cannot use it is Restore, which folds
+      // from ONE location: this server's S3 backups when it has them, else
+      // its backup dir (restore_reads says which). The two cases are mirror
+      // images, so the advice has to be too.
+      const names = c.unreachable_tables.join(", ");
+      card.append(el("p", { class: "cov-line warn", text: c.restore_reads === "s3"
+        ? "Backed up only on this host, not in S3, so \"Restore to a moment\" (which folds from this server's S3 backups) cannot use them: " + names + ". Time-travel still reads them. Take a full backup to send them to S3."
+        : "Backed up only in S3, so \"Restore to a moment\" (which folds from this server's backup dir) cannot use them: " + names + ". Time-travel still reads them. Set this server's S3 location, or take a local backup, to restore them here." }));
     }
   }
   return card;
