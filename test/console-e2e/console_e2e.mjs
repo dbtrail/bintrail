@@ -4104,7 +4104,18 @@ try {
             const el = backupRefreshCard({ carry_forward_unchanged: on, enabled, scheduled, source,
               targets, skipped_s3_only: skipped });
             const t = el.innerText || el.textContent || "";
+            // What sits INSIDE the compact block. Detached, innerText is
+            // textContent, so `t` alone cannot tell visible from compact;
+            // the floor below needs the split (#1603).
+            const fine = Array.from(el.querySelectorAll("details.cn-fine")).map((d) => d.textContent).join("\n");
             rows.push({
+              // The floor: what must stay in plain view is not inside the
+              // compact block, and what moved there by design is.
+              hiddenAlarm: fine.includes("no server can be refreshed"),
+              hiddenDormant: fine.includes("Nothing uses this yet"),
+              hiddenSkip: fine.includes("keep backups only in S3"),
+              compactSaving: fine.includes("only when the last backup is read from this machine"),
+              compactChose: fine.includes("You chose this here"),
               on, enabled, scheduled, source, targets, skipped,
               alarm: t.includes("no server can be refreshed"),
               // The count is read back, not just the sentence: a card that
@@ -4146,6 +4157,11 @@ try {
   const cardBad = cardStates.filter((r) =>
     // the value is on screen, and it is the value
     r.pill !== (r.on ? "On" : "Off")
+    // the compact block never swallows a fault or the dormancy note, and
+    // it does hold the qualifiers that moved there (#1603): a "compact" that
+    // hid the alarm would pass every presence check above
+    || r.hiddenAlarm || r.hiddenDormant || r.hiddenSkip
+    || !r.compactSaving || r.compactChose !== (r.source === "override")
     // dormant is said when nothing consumes the setting, and only then
     || r.dormant !== !r.enabled
     // the middle state is the --baseline-trigger daemon: live for restores,
@@ -4312,10 +4328,11 @@ try {
   (bks.refreshCardHere && bks.cfTiles === 2)
     ? ok("backup-settings: the carry-forward card moved here and draws two backups")
     : bad("backup-settings: the carry-forward card moved here and draws two backups", JSON.stringify({ here: bks.refreshCardHere, rows: bks.cfTiles }));
-  // The drawing cannot lie: the legend draws exactly the verdict set the
-  // API can return, and each seeded server's current case is the source the
-  // API returned for it. Held against the API response, not a list typed
-  // here; the Go side pins the same set to the constants in the handler.
+  // The drawing cannot lie: the legend draws exactly the three verdicts
+  // (the Go side pins that same set to the handler's constants, so a fourth
+  // fails there first), the API's answers all appear in it, and each seeded
+  // server's current case is the source the API returned for it, held
+  // against the response rather than a list typed here.
   const apiSources = (bksAPI.servers || []).map((s) => ({ name: s.name || s.id, source: s.source }));
   const legendSet = bks.legend.slice().sort().join(",");
   const apiSet = Array.from(new Set(apiSources.map((s) => s.source))).sort();
@@ -4329,6 +4346,68 @@ try {
   (bks.moreLinks.length >= 3 && bks.moreLinks.every((h) => h.startsWith("https://www.dbtrail.com/docs/guides/")))
     ? ok("backup-settings: the compact blocks link into the docs guides")
     : bad("backup-settings: the compact blocks link into the docs guides", JSON.stringify(bks.moreLinks));
+  // The states this harness never puts on screen, rendered DETACHED through
+  // the real functions (#1603): the switch drawn ON (three kept, two written,
+  // the kept swatch in the key) and OFF (five written, no kept swatch), a
+  // refused daemon value (loud line under the row, outside the compact
+  // block, value marked), and the serve-mode page (no sections, no daemon
+  // card, its own sub line). Detached so nothing on the live page changes.
+  const bksStates = await page.evaluate(() => {
+    const shape = (on) => {
+      const s = cfShape(on);
+      const rows = Array.from(s.querySelectorAll(".cf-row")).map((r) => ({
+        tiles: r.querySelectorAll(".cf-tile").length, kept: r.querySelectorAll(".cf-tile.cf-kept").length }));
+      return { rows, key: (s.querySelector(".cf-key") || {}).textContent || "",
+        img: s.getAttribute("role") === "img" && (s.getAttribute("aria-label") || "").length > 20 };
+    };
+    const refused = backupDaemonCard([{ key: "lock_mode", value: "ftwrl", err: "bad mode; MySQL dumps are refused until it is fixed", cli: "BINTRAIL_CONSOLE_BASELINE_LOCK_MODE", needs_restart: true }]);
+    const loud = Array.from(refused.querySelectorAll("p.form-msg.err"));
+    const view = document.querySelector(".view");
+    const keep = { monitor: capsCache.monitor, html: view.innerHTML };
+    capsCache.monitor = false;
+    let serve;
+    try {
+      buildBackupSettings({ daemon: [], servers: [{ id: "x", name: "x", source: "none" }], registry_read_only: false }, null);
+      serve = { sections: view.querySelectorAll(".bks-sect").length, boot: !!view.querySelector(".bks-boot"),
+        sub: (view.querySelector(".page-sub") || {}).textContent || "", current: (view.querySelector(".bl-case.is-current") || {}).dataset };
+    } finally { capsCache.monitor = keep.monitor; view.innerHTML = keep.html; }
+    return { on: shape(true), off: shape(false),
+      refused: { marked: !!refused.querySelector(".bks-value.bks-refused"), loud: loud.length === 1 && loud[0].textContent.includes("bad mode"),
+        outside: loud.length === 1 && !loud[0].closest("details") },
+      serve };
+  });
+  const cf = bksStates.on, cfo = bksStates.off;
+  (cf.rows.length === 2 && cf.rows.every((r) => r.tiles === 5) && cf.rows[0].kept === 0 && cf.rows[1].kept === 3 && /kept/.test(cf.key) && cf.img
+    && cfo.rows.length === 2 && cfo.rows.every((r) => r.tiles === 5) && cfo.rows[1].kept === 0 && !/kept/.test(cfo.key) && cfo.img)
+    ? ok("backup-settings: the switch drawn on keeps three of five and written two; off writes all five")
+    : bad("backup-settings: the switch drawn on keeps three of five and written two; off writes all five", JSON.stringify({ on: cf, off: cfo }));
+  (bksStates.refused.marked && bksStates.refused.loud && bksStates.refused.outside)
+    ? ok("backup-settings: a refused daemon value is marked and its reason stays in plain view")
+    : bad("backup-settings: a refused daemon value is marked and its reason stays in plain view", JSON.stringify(bksStates.refused));
+  (bksStates.serve.sections === 0 && !bksStates.serve.boot && bksStates.serve.sub === "Where each server keeps its backups." && bksStates.serve.current && bksStates.serve.current.source === "none")
+    ? ok("backup-settings: on serve the page is the per-server half alone, with its own sub line")
+    : bad("backup-settings: on serve the page is the per-server half alone, with its own sub line", JSON.stringify(bksStates.serve));
+  // Restored the live page above; re-render it so the next assertion reads
+  // the real thing, not the restored HTML with its listeners gone.
+  await page.evaluate(() => renderRoute());
+  await page.waitForFunction(() => document.querySelectorAll(".bks-server input[name=baseline_dir]").length >= 1, undefined, { timeout: 30000 });
+  // Save wakes up on a change and sleeps again when the field is put back;
+  // a Save that stays asleep is an operator who cannot set a backup location.
+  const dirtySave = await page.evaluate(async () => {
+    const box = document.querySelector(".bks-server");
+    const input = box.querySelector("input[name=baseline_dir]");
+    const save = Array.from(box.querySelectorAll("button")).find((b) => b.textContent === "Save");
+    const was = input.value;
+    const fire = () => input.dispatchEvent(new Event("input", { bubbles: true }));
+    const atRest = save.disabled;
+    input.value = was + "x"; fire();
+    const afterEdit = save.disabled;
+    input.value = was; fire();
+    return { atRest, afterEdit, afterRestore: save.disabled };
+  });
+  (dirtySave.atRest && !dirtySave.afterEdit && dirtySave.afterRestore)
+    ? ok("backup-settings: Save wakes on a change and sleeps again when the field is put back")
+    : bad("backup-settings: Save wakes on a change and sleeps again when the field is put back", JSON.stringify(dirtySave));
   // Settled on the LISTING panel, not a timer: the whole page builds in one
   // pass, so once the panel title is up, a mounted card would be too — a
   // sleep could pass this vacuously against a half-rendered page.

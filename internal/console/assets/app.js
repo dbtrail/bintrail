@@ -4062,66 +4062,46 @@ function rotationCard(rot) {
 //
 // The title used to be "Automatic backup refresh" (#1528), which named neither
 // of those and read as a sibling of Scheduled backups on the Backups page,
-// which IS the timetable. It stays HERE rather than moving beside that
-// schedule for a reason the inventory records: /api/baseline-refresh is
+// which IS the timetable. It stays a GLOBAL card rather than moving beside
+// that schedule for a reason the inventory records: /api/baseline-refresh is
 // process-global, the schedule is per server, and a global toggle inside a
 // per-server fold would assert something false.
 //
-// Rewritten because its own reader could not read it: "reuse que? que cosa
-// setea el daemon? no se entiende". Three things came out of that, and undoing
-// any of them puts the card back where it was:
-//
-//   - The two kv rows are GONE. A kv row is for a set of parallel values you
-//     scan, which is what Rotation above genuinely has. This card has exactly
-//     one value, and the second row was not a value at all, it was provenance.
-//     A one-row table is a sentence pretending to be data, and the pretence is
-//     what forced both unreadable keys: "reuse" is a verb with no object, and
-//     "set by" reads like a form field. One state pill plus sentences wins.
-//   - Provenance moved LAST. It used to be line two, above the meaning. A
-//     reader cannot care who chose a setting until he knows what it does, and
-//     it now sits directly above the button that changes it.
-//   - Liveness left the rows. Row two could render "this page (live)" while a
-//     hint below said "Nothing uses this yet"; splitting the jobs means the
-//     contradiction can no longer form, so the "(live)" gating is gone rather
-//     than fixed.
+// Shape (#1528, then #1603): one state pill on the title, the rule drawn
+// (cfShape) with one sentence under it, the alarms and the dormancy note in
+// plain view, the buttons, and everything else in a compact block after them.
+// Provenance (who chose the value) is last, inside that block: a reader
+// cannot care who chose a setting until he knows what it does. Liveness never
+// rides beside the value: the pill says On/Off, the br.enabled line alone says
+// whether anything uses it, so the two cannot contradict each other.
 //
 // The sentence about where the saving applies is a CORRECTNESS fix, not a
-// hedge, and it is keyed to the PRODUCER rather than to where the backups are
-// stored. carryForwardEligible refuses any s3:// previous snapshot, because
+// hedge. carryForwardEligible refuses any s3:// previous snapshot, because
 // carrying a file forward means hard-linking it and a link needs both ends on
-// a filesystem. But srcPath is baselineFoldSource(req), and only ONE of the
-// three producers ever sets BaselineS3:
+// a filesystem. srcPath is baselineFoldSource(req), and only ONE of the three
+// producers ever sets BaselineS3:
 //
 //   consoleapp/baseline_refresh_loop.go  interval loop   BaselineDir only
 //   consoleapp/baseline_schedule_loop.go per-server job  BaselineS3 set
 //   consoleapp/baseline_restore.go       restore         BaselineDir only
 //
-// The field is "Backup S3" (baseline_s3) in the Servers form, NOT "Archive to
-// S3" (archive_s3), which is the binlog archive tier and has nothing to do
-// with this. Naming the wrong one tells a reader who has archive_s3 set and
-// baseline_s3 empty that the saving does not reach them, when it does.
+// So the sentence is keyed to servers with NO local directory ("keeps backups
+// only in S3"): on those every producer refuses. A server carrying BOTH a
+// directory and a bucket is deliberately not described: its scheduled backup
+// does not reuse while the interval loop and every restore do, and one
+// sentence cannot carry that without being false in one direction. The field
+// is "Backup S3" (baseline_s3), NOT "Archive to S3" (archive_s3), which is the
+// binlog archive tier and has nothing to do with this.
 //
-// So on a server carrying BOTH a local directory and a bucket, which is a
-// supported configuration, the interval loop and every restore DO reuse files
-// while the scheduled backup does not. A sentence keyed to storage ("backups
-// in S3 are written in full") is false in both directions on that server: it
-// denies a saving two producers are making, and the setting is changing the
-// on-disk representation of their backups while the card says it is not.
+// The saving is never stated unconditionally. carryForward falls back to a
+// COPY when os.Link fails, and fulltable.go marks the table carried either
+// way; carried_copied (#1578) carries the split to this page, and the run
+// notes qualify their "reused" counts with reusedCopiedNote. The guarantee
+// the reader needs, that the backup is still complete, is what stays absolute.
 //
-// The saving also stopped being stated unconditionally. carryForward falls
-// back to a COPY when os.Link fails, and fulltable.go marks the table carried
-// either way; carried_copied (#1578) carries the split to this page, and the
-// run notes qualify their "reused" counts with reusedCopiedNote so a run
-// that saved nothing no longer reads as a saving. The guarantee the reader
-// needs, that the backup is still complete, is what stays absolute.
-//
-// No command, flag or path appears in any visible string here. A reader
-// clicking buttons who is shown a flag is being told the real answer lives
-// somewhere else.
-//
-// The consequence of a reused file (two backups sharing the same bytes on
-// disk, where the filesystem allows it) is a thing a reader wants while
-// reading docs, not while flipping the switch: docs/console.md carries it.
+// No command, flag or path appears in any visible string here. The
+// consequence of a reused file (two backups sharing the same bytes on disk,
+// where the filesystem allows it) is docs material: docs/console.md has it.
 // cfShape draws what the disk-space switch does (#1603): two backups, one
 // above the other, five tables each. With the switch on, a table that did not
 // change keeps the file the last backup wrote (dashed: the same file, carried
@@ -4182,10 +4162,10 @@ function backupRefreshCard(br) {
   // into the block: same sentences, one click further away.
   let into = card;
   const say = (t) => into.append(el("p", { class: "form-hint", text: t }));
-  // The drawing carries the rule (#1603); one sentence rides under it. Both
-  // arms promise completeness in the same breath as the saving: "keeps the
-  // old file" reads as a partial backup otherwise, and that is the one thing
-  // a recovery tool must never let a reader believe.
+  // The drawing carries the rule (#1603); one sentence rides under it. The
+  // on arm promises completeness in the same breath as the saving: "keeps
+  // the old file" reads as a partial backup otherwise, and that is the one
+  // thing a recovery tool must never let a reader believe.
   card.append(cfShape(on));
   say(on
     ? "Tables with no changes keep their last file. The backup is still complete."
@@ -4206,6 +4186,17 @@ function backupRefreshCard(br) {
   // consumer there is no restore path either, so waiting changes nothing.
   if (!br.enabled) {
     say("Nothing uses this yet. It starts working the next time dbtrail runs with backups or restores turned on.");
+  }
+  // What the skipped servers CANNOT do, not what they will do: an update from
+  // the recorded changes writes Parquet to a local directory, which is the very
+  // field these servers lack, so the bucket is never read back into a cheaper
+  // backup (#1579). Visible, not compact, because on THIS install it is the
+  // exception to the sentence above the button: a drawing that promises a
+  // saving must carry, in plain view, the servers it cannot save for. The
+  // positive form would be a PREDICTION this card has no gate data for; the
+  // per-server rows make it, after checking the refusal.
+  if (br.skipped_s3_only > 0) {
+    say(br.skipped_s3_only + " server(s) keep backups only in S3, so the timer skips them. The only backup they can get is a full one.");
   }
   const foot = el("div", { class: "stg-cardfoot" },
     el("button", {
@@ -4232,14 +4223,6 @@ function backupRefreshCard(br) {
   const more = cnFine("More about disk space");
   into = more;
   say("It saves disk only when the last backup is read from this machine. A server that keeps backups only in S3 reuses nothing, so every backup writes every table.");
-  // What the skipped servers CANNOT do, not what they will do: an update from
-  // the recorded changes writes Parquet to a local directory, which is the very
-  // field these servers lack, so the bucket is never read back into a cheaper
-  // backup. The positive form would be a PREDICTION this card has no gate
-  // data for; the per-server rows make it, after checking the refusal.
-  if (br.skipped_s3_only > 0) {
-    say(br.skipped_s3_only + " server(s) keep backups only in S3, so the timer skips them. The only backup they can get is a full one.");
-  }
   // A daemon started with the backup trigger and no refresh schedule still
   // applies this to restores, so it is not dormant there.
   if (br.enabled && !br.scheduled) {
@@ -4375,8 +4358,9 @@ const BACKUP_DAEMON_ROWS = {
 // interval is a loop that never runs, an empty table filter is every table.
 // The word renders as a value in the muted style; "not set" read as a fault
 // on nine rows of a healthy install. lock_mode is never empty on the wire
-// (the daemon resolves its default before reporting) and trigger is a
-// boolean; both carry an entry so the table stays one-to-one with the rows.
+// under watch, the only surface that renders this card (the daemon resolves
+// its default before reporting), and trigger is a boolean; both carry an
+// entry so the table stays one-to-one with the rows.
 const BACKUP_DAEMON_EMPTY = {
   baseline_dir: "none",
   baseline_s3: "none",
@@ -4448,7 +4432,15 @@ const BACKUP_SOURCE_CASES = {
 // Marks are characters, not colour alone. `current` marks the row that is
 // this server's answer; the legend renders all three unmarked.
 function blCase(source, current) {
-  const c = BACKUP_SOURCE_CASES[source] || { name: source, reads: false, writes: false };
+  const c = BACKUP_SOURCE_CASES[source];
+  // A verdict this build does not know draws as unknown, with no lanes: two
+  // crosses would read as "no location", which is a claim, not an unknown.
+  if (!c) {
+    return el("div", { class: "bl-case bl-unknown" + (current ? " is-current" : ""), "data-source": source || "",
+      "aria-current": current ? "true" : null },
+      el("span", { class: "bl-name", text: "Unknown" }),
+      el("span", { class: "bl-lane", text: "this console cannot read this server's backup state; update it" }));
+  }
   const lane = (label, ok) => el("span", { class: "bl-lane " + (ok ? "on" : "no") },
     el("span", { class: "bl-mark", text: ok ? "✓" : "✗" }), label);
   return el("div", { class: "bl-case" + (current ? " is-current" : ""), "data-source": source,
@@ -4571,8 +4563,8 @@ function backupServerRow(srv, readOnly) {
     // provenance row depends on the resolution the daemon just recomputed.
     renderRoute();
   };
-  // Save sits right under the fields it saves; the compact block comes
-  // last, as on the disk-space card.
+  // Save comes after the drawing and any refusal, above the compact block,
+  // as on the disk-space card: the block is for reading, not for acting.
   box.append(el("div", { class: "stg-cardfoot" }, save), msg);
   box.append(cnFine("More about this server", ...more));
   return box;

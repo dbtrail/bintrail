@@ -527,7 +527,7 @@ Two section labels split it: **Change here** and **Set when dbtrail starts**.
 - **Backups & disk space** (change here) — the carry-forward toggle, moved
   here from the Backups page; it applies live. What it does is drawn: two
   backups of five tables, the unchanged ones carried across as dashed tiles
-  and the changed ones written again, with one sentence beside it. The
+  and the changed ones written again, with one sentence under it. The
   local-only rule, the S3 skip count and whose choice the value was sit in a
   compact **More about disk space** block, with links into the docs guide.
 - **Per server** (change here) — each registry server's Backup dir, Backup

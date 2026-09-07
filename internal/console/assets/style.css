@@ -2975,6 +2975,7 @@ button { font-family: inherit; }
 .bl-lane.no .bl-mark { color: var(--delete); }
 .bl-lane.no { color: var(--ink-3); }
 .bks-server .bl-case { margin: 10px 0 6px; }
+.bl-case.bl-unknown .bl-name { color: var(--delete); }
 .bl-case.is-current { background: var(--violet-tint); border-color: var(--violet-line); color: var(--ink-2); }
 .bl-case.is-current .bl-name { color: var(--ink); }
 .bl-case.is-current .bl-lane.no { color: var(--ink-2); }

@@ -148,7 +148,9 @@ func jsObjectKeys(t *testing.T, js, name string) []string {
 		t.Fatalf("%s is not terminated by a `};` line", name)
 	}
 	var keys []string
-	for _, m := range regexp.MustCompile(`(?m)^\s+"?([a-z_]+)"?:`).FindAllStringSubmatch(rest[:j], -1) {
+	// Digits allowed: baseline_s3 is a key, and a class that cannot read it
+	// compared two tables that both silently lacked it.
+	for _, m := range regexp.MustCompile(`(?m)^\s+"?([a-z0-9_]+)"?:`).FindAllStringSubmatch(rest[:j], -1) {
 		keys = append(keys, m[1])
 	}
 	return keys
@@ -239,15 +241,19 @@ func visibleChars(body string) int {
 	if i := strings.Index(body, "cnFine("); i >= 0 {
 		visible = body[:i]
 	}
+	// Every literal inside a text: value or a say(...) call, so a sentence
+	// split over `+` or built around a count still weighs what it renders.
+	// Both arms of a ternary count: the source cannot tell which renders.
+	lit := regexp.MustCompile(`"((?:[^"\\]|\\.)*)"`)
 	total := 0
 	for _, re := range []*regexp.Regexp{
-		regexp.MustCompile(`text:\s*"([^"]*)"`),
-		regexp.MustCompile(`say\("([^"]*)"`),
-		regexp.MustCompile(`\? "([^"]*)"`),
-		regexp.MustCompile(`\? "[^"]*"\s*:\s*"([^"]*)"`),
+		regexp.MustCompile(`text:\s*((?:"(?:[^"\\]|\\.)*"|[^,}\n])*)`),
+		regexp.MustCompile(`say\(([^;]*)\);`),
 	} {
 		for _, m := range re.FindAllStringSubmatch(visible, -1) {
-			total += len(m[1])
+			for _, l := range lit.FindAllStringSubmatch(m[1], -1) {
+				total += len(l[1])
+			}
 		}
 	}
 	return total
@@ -270,14 +276,16 @@ func TestBackupSettingsStaysCompact(t *testing.T) {
 	}
 	// The budget covers every arm of every conditional at once (the source
 	// cannot tell which render), so it sits above any one rendered state. By
-	// this count the pre-#1603 refresh card measured 969 characters and the
-	// rewrite 299; the daemon card 175 (its hint paragraph) and 83 (title,
-	// chip, the empty-value words). A rewrite that starts explaining again
-	// rings here before the e2e sees it.
-	if n := visibleChars(refresh); n > 450 {
+	// this exact count on both trees: the pre-#1603 refresh card 1071 and the
+	// rewrite 497 (the drawing's one sentence, the alarm, the dormancy note
+	// and the S3 skip note, all deliberately visible); the daemon card 222
+	// (its hint paragraph) and 106 (title, chip, the refused-value line). The
+	// caps sit ~40% above the rewrite and ~30% below the old card, so a copy
+	// edit breathes but explaining again rings here before the e2e sees it.
+	if n := visibleChars(refresh); n > 700 {
 		t.Errorf("backupRefreshCard's visible text is %d characters; the drawing carries the rule, so put the rest behind cnFine", n)
 	}
-	if n := visibleChars(daemon); n > 150 {
+	if n := visibleChars(daemon); n > 160 {
 		t.Errorf("backupDaemonCard's visible text is %d characters beyond its rows; explain in the compact block, not above the rows", n)
 	}
 
@@ -315,11 +323,14 @@ func TestBackupSettingsStaysCompact(t *testing.T) {
 		t.Error("the daemon card is inside the tinted .cards grid again; tinted vs plain is the mark that tells the kinds apart")
 	}
 
-	// No em dash in anything these surfaces can render.
-	for name, body := range map[string]string{"backupRefreshCard": refresh, "backupDaemonCard": daemon, "backupServerRow": row, "buildBackupSettings": build, "cfShape": functionBody(t, js, "function cfShape("), "blCase": functionBody(t, js, "function blCase(")} {
-		for _, m := range regexp.MustCompile(`text:\s*"([^"]*)"`).FindAllStringSubmatch(body, -1) {
+	// No em dash in any string literal these surfaces hold: text: values,
+	// say() arguments, bare text children and aria labels alike. Over the
+	// comment-stripped bodies, so a comment's dash does not ring.
+	for name, body := range map[string]string{"backupRefreshCard": refresh, "backupDaemonCard": daemon, "backupServerRow": row,
+		"buildBackupSettings": jsFunctionBody(t, js, "buildBackupSettings"), "cfShape": jsFunctionBody(t, js, "cfShape"), "blCase": jsFunctionBody(t, js, "blCase")} {
+		for _, m := range regexp.MustCompile(`"([^"\n]*)"`).FindAllStringSubmatch(body, -1) {
 			if strings.Contains(m[1], "—") {
-				t.Errorf("%s renders an em dash in %q", name, m[1])
+				t.Errorf("%s holds an em dash in %q", name, m[1])
 			}
 		}
 	}
