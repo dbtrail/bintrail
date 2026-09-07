@@ -305,3 +305,47 @@ func TestBaselineRestore_carriesTheEffectiveReuseSetting(t *testing.T) {
 }
 
 func boolPtrRestore(b bool) *bool { return &b }
+
+// TestBaselineRestore_carriesTheServersS3Destination: the handler puts the
+// server's OWN S3 destination in the request, so the restore looks for the
+// backup to fold from where the scheduled update looks (#1541). Both shapes
+// are asserted: a dir-only server must reach the restorer with an empty S3,
+// or a local-only restore would start uploading.
+func TestBaselineRestore_carriesTheServersS3Destination(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		s3   string
+	}{
+		{"backups go to S3: the request carries the bucket", "s3://bucket/backups/"},
+		{"local only: the request carries no bucket", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubRestorer{}
+			srv := newRestoreServer(t, stub)
+			dir := t.TempDir()
+			e, err := srv.cm.reg.Add(ServerEntry{
+				Name: "wp", DSN: "idx:pw@tcp(127.0.0.1:3306)/binlog_index",
+				SourceDSN: "src:pw@tcp(127.0.0.1:3306)/", BaselineDir: dir, BaselineS3: tc.s3,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			rec, body := doServersReq(t, srv, "POST", "/api/servers/"+e.ID+"/baseline/restore",
+				`{"at":"2026-01-02 03:04:05"}`)
+			if rec.Code != 202 {
+				t.Fatalf("POST code=%d body=%s", rec.Code, body)
+			}
+			if stub.last == nil {
+				t.Fatal("no restore request reached the restorer, so the assertion below checks nothing")
+			}
+			if stub.last.BaselineS3 != tc.s3 || stub.last.BaselineDir != dir {
+				t.Errorf("request carried dir=%q s3=%q, want dir=%q s3=%q",
+					stub.last.BaselineDir, stub.last.BaselineS3, dir, tc.s3)
+			}
+			if got := stub.last.FoldSource(); got != BaselineFoldSource(ServerEntry{BaselineDir: dir, BaselineS3: tc.s3}) {
+				t.Errorf("FoldSource() = %q, disagrees with BaselineFoldSource for the same server", got)
+			}
+		})
+	}
+}

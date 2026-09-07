@@ -142,16 +142,37 @@ type BaselineRestorer interface {
 
 // BaselineRestoreRequest identifies the server and the instant to restore to.
 type BaselineRestoreRequest struct {
-	ServerID    string
-	ServerName  string
-	IndexDSN    string
+	ServerID   string
+	ServerName string
+	IndexDSN   string
+	// BaselineDir is the server's own local directory: where the fold WRITES,
+	// and where it reads the backup to fold from when BaselineS3 is empty.
 	BaselineDir string
-	At          time.Time
+	// BaselineS3 is the server's configured S3 destination, or empty. When
+	// set, the backup to fold from is looked for in the bucket (see
+	// FoldSource) and the finished snapshot is uploaded there, so the restore
+	// behaves like the scheduled update on the same server (#1541). Before it
+	// was carried, the restore listed the local directory alone, which on an
+	// S3-backed server holds only what this daemon folded since it started,
+	// and refused with "no backup exists" while the bucket held dozens.
+	BaselineS3 string
+	At         time.Time
 	// CarryForwardUnchanged is the effective setting the console resolved for
 	// this restore. A restore is the same fold the refresh performs, into the
 	// same store, so it honours the same operator choice; leaving it out is
 	// how the two silently diverged.
 	CarryForwardUnchanged bool
+}
+
+// FoldSource is where the restore reads the backup it folds forward: the
+// bucket when the server has one, else the local directory. The same rule as
+// BaselineFoldSource, on the request rather than the registry entry, so the
+// consumer in consoleapp cannot re-derive it differently.
+func (r BaselineRestoreRequest) FoldSource() string {
+	if r.BaselineS3 != "" {
+		return r.BaselineS3
+	}
+	return r.BaselineDir
 }
 
 type BaselineStatus struct {
@@ -360,10 +381,14 @@ func (s *Server) handleBaselineRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req := BaselineRestoreRequest{
-		ServerID:              e.ID,
-		ServerName:            e.Name,
-		IndexDSN:              e.DSN,
-		BaselineDir:           e.BaselineDir,
+		ServerID:    e.ID,
+		ServerName:  e.Name,
+		IndexDSN:    e.DSN,
+		BaselineDir: e.BaselineDir,
+		// The server's OWN destination, as the scheduled update carries it
+		// (baseline_schedule_loop.go). Not the daemon-wide --baseline-s3: that
+		// is a shared store, for the reason BaselineDir above is not defaulted.
+		BaselineS3:            e.BaselineS3,
 		At:                    at,
 		CarryForwardUnchanged: s.effectiveBaselineRefresh().CarryForwardUnchanged,
 	}
