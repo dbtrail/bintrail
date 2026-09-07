@@ -4120,7 +4120,7 @@ function cfShape(on) {
   // Three of five carried: enough kept tiles to read as the rule, enough
   // rewritten ones to read as "still a backup".
   const next = on ? ["cf-kept", "cf-kept", "cf-new", "cf-kept", "cf-new"] : ["cf-new", "cf-new", "cf-new", "cf-new", "cf-new"];
-  const shape = el("div", { class: "cf-shape" + (on ? "" : " cf-off"), role: "img",
+  const shape = el("div", { class: "cf-shape", role: "img",
     "aria-label": on
       ? "Two backups. In the newer one, tables with no changes keep the file from the last backup and only changed tables are written again. Every table is present."
       : "Two backups. In the newer one every table is written again, changed or not." },
@@ -4535,7 +4535,9 @@ function backupServerRow(srv, readOnly) {
   if (readOnly) { dir.disabled = s3.disabled = noArch.disabled = true; }
   // Save wakes up when something differs from what was loaded, so a click
   // always means a change; Enter in a field saves too.
-  const was = { dir: srv.baseline_dir || "", s3: srv.baseline_s3 || "", noArch: !!srv.no_archive };
+  // Trimmed on both sides: the PUT trims, so a stored value with stray
+  // whitespace is not a change waiting to be saved.
+  const was = { dir: (srv.baseline_dir || "").trim(), s3: (srv.baseline_s3 || "").trim(), noArch: !!srv.no_archive };
   const dirty = () => dir.value.trim() !== was.dir || s3.value.trim() !== was.s3 || noArch.checked !== was.noArch;
   const sync = () => { save.disabled = !!readOnly || !dirty(); };
   for (const input of [dir, s3]) {

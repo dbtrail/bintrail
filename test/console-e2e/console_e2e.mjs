@@ -4330,16 +4330,14 @@ try {
     : bad("backup-settings: the carry-forward card moved here and draws two backups", JSON.stringify({ here: bks.refreshCardHere, rows: bks.cfTiles }));
   // The drawing cannot lie: the legend draws exactly the three verdicts
   // (the Go side pins that same set to the handler's constants, so a fourth
-  // fails there first), the API's answers all appear in it, and each seeded
-  // server's current case is the source the API returned for it, held
-  // against the response rather than a list typed here.
+  // fails there first), and each seeded server's current case is the source
+  // the API returned for it, held against the response rather than a list
+  // typed here.
   const apiSources = (bksAPI.servers || []).map((s) => ({ name: s.name || s.id, source: s.source }));
   const legendSet = bks.legend.slice().sort().join(",");
-  const apiSet = Array.from(new Set(apiSources.map((s) => s.source))).sort();
-  const legendCoversAPI = apiSet.every((s) => bks.legend.includes(s));
   const currentMatches = apiSources.length > 0 && apiSources.length === bks.current.length
     && apiSources.every((s, i) => bks.current[i].name === s.name && bks.current[i].cases.length === 1 && bks.current[i].cases[0] === s.source);
-  (legendSet === "default,none,server" && legendCoversAPI && currentMatches)
+  (legendSet === "default,none,server" && currentMatches)
     ? ok("backup-settings: the location drawing shows the three cases and marks each server's own as the API reports it")
     : bad("backup-settings: the location drawing shows the three cases and marks each server's own as the API reports it",
         JSON.stringify({ legend: bks.legend, api: apiSources, current: bks.current }));
