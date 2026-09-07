@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backed up only on this host, which the daemon-wide refresh interval and a
   failed upload both produce. The Backups page's restore lane offers the
   snapshots the fold reads, and says which location the skipped ones are in.
+
 ### Changed
 - **Console: the Backups & snapshots settings page is now Backup settings, and
   it shows the three kinds of setting instead of describing them** (#1603).
