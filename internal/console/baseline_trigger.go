@@ -339,6 +339,15 @@ func (s *Server) handleBaselineRestore(w http.ResponseWriter, r *http.Request) {
 		// on purpose (reconstruct's leftover rule), and the listing hides it,
 		// so "use that backup" would name something the operator cannot see.
 		if baseline.SnapshotComplete(snapDir) {
+			// The fold WRITES here whatever it reads from, so this is a
+			// collision either way; "use that backup" is only advice when the
+			// restore would read it, which on an S3-backed server it does not
+			// (a local-only snapshot is the leftover of a failed upload).
+			if e.BaselineS3 != "" {
+				writeJSONError(w, http.StatusConflict,
+					"a backup already exists on this host at exactly "+at.Format(consoleTSFormat)+"; pick another second")
+				return
+			}
 			writeJSONError(w, http.StatusConflict,
 				"a backup already exists at exactly "+at.Format(consoleTSFormat)+"; pick another second, or use that backup")
 			return

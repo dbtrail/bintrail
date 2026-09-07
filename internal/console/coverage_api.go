@@ -140,32 +140,33 @@ type tableAnchors struct {
 	newest                  time.Time
 	earliestUsable          time.Time
 	earliestUsableReachable time.Time
-	// hasLocal and newestLocal describe the LOCAL copies alone. On a server
-	// whose Restore reads the local directory they decide whether a fresh copy
-	// in a bucket is reachable by anything at all:
-	//
-	// bundle.findBaseline falls back to the bucket only on ErrNoBaseline (#766).
-	// A table with ANY local snapshot at-or-before the requested instant gets a
-	// nil error from the local root, so the fallback never fires and time travel
-	// resolves the STALE local copy. Under reach kind "dir" its fresh S3 sibling
-	// is then unreachable from every console surface, which is the pre-#1571
-	// verdict: broken. Under "s3" Restore folds that sibling from the bucket,
-	// so the same shape is restorable and this pair is not consulted.
-	hasLocal    bool
-	newestLocal time.Time
+	// hasSource and newestSource describe the copies in the location the
+	// Restore reads (restoreReach), usable or not. They decide the verdict for
+	// a table whose SOURCE copy is stale while a fresh copy sits elsewhere:
+	// the fold anchors on the newest source copy at-or-before the instant, so
+	// a stale one refuses the whole restore (capture gap), and the fresh copy
+	// in the other location does not help the button — under "dir" because
+	// bundle.findBaseline falls back to the bucket only on ErrNoBaseline
+	// (#766), so time travel resolves the stale local copy too and no console
+	// surface reaches the bucket; under "s3" because the fold reads the bucket
+	// and the local-only fresh copy (a failed upload, the daemon-wide refresh)
+	// was never sent there. Both are broken, not unreachable: the remedy is a
+	// fresh backup, which is what broken advises.
+	hasSource    bool
+	newestSource time.Time
 }
 
 // observe folds one baseline file's anchor in, with the verdict already graded
 // against the delta floor. Usable means at or above the floor — ok and aging
 // both qualify; aging says the window is shrinking, not that it is gone.
-func (a *tableAnchors) observe(ts time.Time, v status.BaselineStalenessVerdict, local, reachable bool) {
+func (a *tableAnchors) observe(ts time.Time, v status.BaselineStalenessVerdict, reachable bool) {
 	if ts.After(a.newest) {
 		a.newest = ts
 	}
-	if local {
-		a.hasLocal = true
-		if ts.After(a.newestLocal) {
-			a.newestLocal = ts
+	if reachable {
+		a.hasSource = true
+		if ts.After(a.newestSource) {
+			a.newestSource = ts
 		}
 	}
 	switch v {
@@ -258,10 +259,10 @@ func gradeFullTable(files []reconstruct.BaselineFile, reach restoreReach, floor 
 			a = &tableAnchors{}
 			anchors[k] = a
 		}
-		// A file present in BOTH locations kept its LOCAL path in the merge,
-		// so a "dir" path means a local copy exists; reach.inS3 says whether
-		// the bucket has it too.
-		a.observe(f.SnapshotTime, floor.Grade(f.SnapshotTime, now), baselineKindOf(f.Path) == "dir", reach.reaches(f))
+		// A file present in BOTH locations kept its LOCAL path in the merge;
+		// reach.reaches consults reach.inS3 for that, so the kind of the path
+		// alone never decides.
+		a.observe(f.SnapshotTime, floor.Grade(f.SnapshotTime, now), reach.reaches(f))
 	}
 
 	var v fullTableVerdict
@@ -275,37 +276,31 @@ func gradeFullTable(files []reconstruct.BaselineFile, reach restoreReach, floor 
 			}
 			continue
 		}
-		if a.hasLocal && reach.kind == "dir" {
-			// Restore reads the local directory, and a stale local copy
-			// SHADOWS the fresh offsite one for time-travel too: findBaseline
-			// gets a nil error from the local root, so the #766 fallback never
-			// fires and no console surface reaches the bucket. Graded on the
-			// newest LOCAL anchor, which is exactly the verdict this card gave
-			// before it read both locations. Calling it unreachable would
-			// trade a red "take a fresh backup" for a warning that promises a
-			// time travel that resolves the stale copy instead.
-			//
-			// Under "s3" this branch must NOT run: there the fresh copy in the
-			// bucket is what Restore folds from, so the table took the branch
-			// above, and a table whose only usable copy is local is
-			// unreachable rather than broken.
-			if floor.Grade(a.newestLocal, now) == status.BaselineBroken {
+		if a.hasSource {
+			// The source has copies of this table and none is usable (branch 1
+			// took the usable ones): the fold would anchor on the newest of
+			// them and refuse. A fresh copy in the OTHER location does not
+			// rescue the button (see tableAnchors), so this is broken on the
+			// newest SOURCE anchor — under "dir" exactly the verdict this card
+			// gave before it read both locations. Calling it unreachable
+			// would trade a red "take a fresh backup" for a warning that says
+			// the backup merely lives elsewhere.
+			if floor.Grade(a.newestSource, now) == status.BaselineBroken {
 				v.broken = append(v.broken, k)
 				continue
 			}
-			// Only the ambiguity demotion reaches here: every local anchor is
-			// below the floor (branch 1 took the usable ones), so the grade is
-			// Broken unless BelowIsUnknown turned it into Unknown. Named rather
-			// than dropped -- this is the shape the shadowing check exists to
-			// catch, and on a multi-source index it is the ROUTINE verdict, so
-			// silently unevaluable would erase it most of the time.
+			// Only the ambiguity demotion reaches here: every source anchor is
+			// below the floor, so the grade is Broken unless BelowIsUnknown
+			// turned it into Unknown. Named rather than dropped -- on a
+			// multi-source index it is the ROUTINE verdict, so silently
+			// unevaluable would erase it most of the time.
 			v.unevaluable = append(v.unevaluable, k)
 			continue
 		}
 		if !a.earliestUsable.IsZero() {
-			// A usable backup exists, in a location the Restore button does
-			// not read: only in a bucket on a dir-only server, only on this
-			// host on an S3-backed one. Named, not folded into the window and
+			// A usable backup exists, and the Restore's source holds NO copy
+			// of this table at all: only in a bucket on a dir-only server,
+			// only on this host on an S3-backed one. Named, not folded into the window and
 			// not called broken: counting this anchor would print a start the
 			// button then refuses, while broken drives an alarm a backup that
 			// exists does not deserve. Time-travel reads it either way (#766).
@@ -409,25 +404,22 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 		restoreNeedsLocal := !slices.ContainsFunc(baselineSourcesOf(b),
 			func(s string) bool { return baselineKindOf(s) == "dir" })
 		resp.RestoreNeedsLocal = restoreNeedsLocal
-		// Where the Restore button reads, from the server's OWN locations
-		// (handleBaselineRestore uses the entry, never the daemon-wide
-		// defaults). A server with no location of its own — the boot entry,
-		// or a registry entry inheriting --baseline-dir/--baseline-s3 — is
-		// graded from its bundle's sources instead, which classify the same
-		// way: Restore refuses those servers for a different reason (#1602),
-		// and grading them as reading nothing would render the "no usable
-		// baseline exists yet" shape over a backup that is there.
+		// Where the Restore button reads, classified from the bundle's
+		// locations. withBaselineDefaults is all-or-nothing, so for a server
+		// that names locations of its own these ARE its own, the ones
+		// handleBaselineRestore uses; for one that names none — the boot
+		// entry, or a registry entry inheriting --baseline-dir/--baseline-s3 —
+		// they are the daemon-wide ones. That server is graded against them
+		// anyway, because Restore refuses it for a different reason (#1602)
+		// and grading it as reading nothing would render the "no usable
+		// baseline exists yet" shape over a backup that is there; the card
+		// says "inherited" instead of the kind so it does not claim a button
+		// the page does not render. Stays "" when even those locations give
+		// the fold nowhere to write, which is the restore_needs_local shape.
 		reads := restoreReadsFrom(bundleBaselineDir(b), bundleBaselineS3(b))
-		// Reported as "inherited" rather than the kind: the window is graded
-		// from a location the server did not name, and Restore refuses it
-		// either way. Stays "" when even the inherited locations give the fold
-		// nowhere to write, which is the restore_needs_local shape.
-		if reads != "" {
+		resp.RestoreReads = reads
+		if e, ok := s.selectedEntry(r); reads != "" && (!ok || (e.BaselineDir == "" && e.BaselineS3 == "")) {
 			resp.RestoreReads = "inherited"
-		}
-		if e, ok := s.selectedEntry(r); ok && (e.BaselineDir != "" || e.BaselineS3 != "") {
-			reads = restoreReadsFrom(e.BaselineDir, e.BaselineS3)
-			resp.RestoreReads = reads
 		}
 
 		merged := listBaselinesMerged(r.Context(), baselineSourcesOf(b), reconstruct.ListBaselines)

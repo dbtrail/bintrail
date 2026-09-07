@@ -464,19 +464,13 @@ func TestCoverageAPI_aDirBackedServerDoesNotAskForALocalFolder(t *testing.T) {
 	}
 }
 
-// The handler takes where Restore reads from the server's OWN entry, which is
-// what handleBaselineRestore uses, not from the bundle's resolved sources. The
-// shape that tells them apart is real: a registry server with a local
-// directory of its own on a daemon started with --baseline-s3. The bundle
-// carries that daemon-wide bucket as its fallback, but the entry names no S3,
-// so Restore folds from the directory and the card must say "dir". Grading
-// the bundle's sources instead would say "s3" and count anchors the button
-// never opens.
-func TestCoverageAPI_restoreReadsComesFromTheServersOwnEntry(t *testing.T) {
+// A registry server that names a location of its own is graded against it
+// and the card says the kind: this is the only shape whose Restore button
+// runs, and withBaselineDefaults hands the bundle exactly those locations.
+func TestCoverageAPI_aServerWithItsOwnDirReportsDir(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	latest := now.Add(-30 * time.Second)
 	part := now.Add(-100 * time.Hour).Format("p_2006010215")
-	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 
 	reg, err := LoadRegistry(t.TempDir() + "/console-servers.yaml")
 	if err != nil {
@@ -493,7 +487,7 @@ func TestCoverageAPI_restoreReadsComesFromTheServersOwnEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv.cm.bundles[e.ID] = &bundle{db: coverageMockDB(t, part, latest, nil), dbName: "binlog_index",
-		baselineSrc: dir, baselineFallbackSrc: "s3://daemon-wide/backups/", baselineConfigured: true}
+		baselineSrc: dir, baselineConfigured: true}
 
 	rec, body := doServersReqHeader(t, srv, "GET", "/api/coverage", "", e.ID)
 	if rec.Code != 200 {
@@ -504,12 +498,7 @@ func TestCoverageAPI_restoreReadsComesFromTheServersOwnEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.RestoreReads != "dir" {
-		t.Errorf("restore_reads = %q, want dir: this server names no S3 of its own, so its Restore "+
-			"folds from the directory; the daemon-wide bucket in the bundle is Time-travel's fallback, "+
-			"not the button's source", got.RestoreReads)
-	}
-	if got.RestoreNeedsLocal {
-		t.Error("restore_needs_local is true on a server that has a local directory to fold into")
+		t.Errorf("restore_reads = %q, want dir: this server names its own directory, so its Restore runs and folds from it", got.RestoreReads)
 	}
 }
 
@@ -555,5 +544,28 @@ func TestCoverageAPI_anEntryInheritingTheDaemonDirKeepsItsWindow(t *testing.T) {
 		t.Errorf("restore_reads = %q full_table_from = %q, want inherited and a window: the inherited "+
 			"directory holds a healthy backup, so reading nothing would erase it from the card, and "+
 			"calling it dir would claim a Restore button the server does not get (#1602)", got.RestoreReads, got.FullTableFrom)
+	}
+}
+
+// The s3 twin of the stale-local shadow: the bucket holds only a STALE copy
+// (uploaded, then pruned locally) while a fresh copy sits on this host alone
+// (a restore whose upload failed, or the daemon-wide refresh). Restore reads
+// the bucket, anchors on the stale copy and refuses the whole run, so this is
+// broken — "take a fresh backup" is the remedy, and a full backup sends the
+// directory up. Calling it unreachable would say "backed up only on this
+// host", which is false: an older copy IS in S3, and it is the one the
+// button would use.
+func TestGradeFullTable_s3Restore_aStaleBucketCopyIsBrokenNotUnreachable(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	floor := status.DeltaFloor{Hour: now.Add(-100 * time.Hour)}
+
+	got := gradeFullTable([]reconstruct.BaselineFile{
+		{Schema: "shop", Table: "orders", SnapshotTime: now.Add(-200 * time.Hour), Path: "s3://bucket/prefix/2026/shop/orders.parquet"},
+		{Schema: "shop", Table: "orders", SnapshotTime: now.Add(-time.Hour), Path: "/backups/2026/shop/orders.parquet"},
+	}, restoreReach{kind: "s3"}, floor, now)
+
+	if !slices.Equal(got.broken, []string{"shop.orders"}) || len(got.unreachable) != 0 {
+		t.Errorf("broken=%v unreachable=%v, want [shop.orders] broken: the bucket copy the fold anchors on "+
+			"predates coverage, and the fresh local copy was never sent there", got.broken, got.unreachable)
 	}
 }
